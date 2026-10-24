@@ -1,0 +1,593 @@
+<!doctype html>
+<html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#041a24"><meta name="robots" content="noindex"><meta name="referrer" content="no-referrer"><title>القاعة الافتراضية — مركز البحوث والدراسات الاستشارية</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;700;900&display=swap"></head><body>
+<script>
+function makeKit(k) {
+    var te = new TextEncoder(), td = new TextDecoder(), KEY = null;
+    function b2u(buf) { var b = new Uint8Array(buf), s = ''; for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
+    function u2b(s) { s = String(s).replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; var r = atob(s), b = new Uint8Array(r.length); for (var i = 0; i < r.length; i++) b[i] = r.charCodeAt(i); return b; }
+    function key() { return KEY || (KEY = crypto.subtle.importKey('raw', u2b(k), 'AES-GCM', false, ['encrypt', 'decrypt'])); }
+    async function z(bytes) { if (typeof CompressionStream === 'undefined') return null; try { var cs = new CompressionStream('deflate-raw'), w = cs.writable.getWriter(); w.write(bytes); w.close(); return new Uint8Array(await new Response(cs.readable).arrayBuffer()); } catch (e) { return null; } }
+    async function uz(bytes) { var ds = new DecompressionStream('deflate-raw'), w = ds.writable.getWriter(); w.write(bytes); w.close(); return new Uint8Array(await new Response(ds.readable).arrayBuffer()); }
+    return {
+      b2u: b2u, u2b: u2b,
+      enc: async function (o) { var raw = te.encode(JSON.stringify(o)), zz = raw.length > 600 ? await z(raw) : null, body = zz && zz.length < raw.length ? zz : raw, flag = body === zz ? 1 : 0, iv = crypto.getRandomValues(new Uint8Array(12)), ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, await key(), body); var all = new Uint8Array(13 + ct.byteLength); all[0] = flag; all.set(iv, 1); all.set(new Uint8Array(ct), 13); return b2u(all); },
+      dec: async function (s) { var all = u2b(s), pt = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: all.slice(1, 13) }, await key(), all.slice(13))); if (all[0] === 1) pt = await uz(pt); return JSON.parse(td.decode(pt)); }
+    };
+  }
+function makeBus(OPT, kit) {
+    OPT = OPT || {};
+    var brokers = (OPT.brokers || []).filter(function (u) { return /^wss?:\/\//i.test(String(u || '')); }).slice(0, 5);
+    var ntfyBase = String(OPT.ntfy || '').replace(/\/+$/, ''), ntfyMode = OPT.ntfyMode || 'fallback', pref = OPT.prefix || 'rascev/';
+    var te = new TextEncoder(), td = new TextDecoder();
+    var subs = {}, seen = {}, seenQ = [], listeners = [], closed = false, ntfySubs = {}, NT = { st: ntfyBase ? 'wait' : 'off', err: '' };
+    function rid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 9); }
+    function emit() { var s = status(); listeners.slice().forEach(function (f) { try { f(s); } catch (e) { } }); }
+    function mark(u) { if (!u) return false; if (seen[u]) return true; seen[u] = 1; seenQ.push(u); if (seenQ.length > 4000) delete seen[seenQ.shift()]; return false; }
+    function deliver(topic, obj, meta) { if (!obj || typeof obj !== 'object') return; if (mark(obj._u)) return; var L = subs[topic]; if (!L) return; L.slice().forEach(function (f) { try { f(obj, meta || {}); } catch (e) { try { console.warn('[bus]', e); } catch (x) { } } }); }
+    function str(s) { var b = te.encode(s), o = new Uint8Array(2 + b.length); o[0] = b.length >> 8; o[1] = b.length & 255; o.set(b, 2); return o; }
+    function rlen(n) { var o = []; do { var d = n % 128; n = Math.floor(n / 128); if (n > 0) d |= 128; o.push(d); } while (n > 0); return o; }
+    function pkt(h, parts) { var len = parts.reduce(function (s, p) { return s + p.length; }, 0), L = rlen(len), o = new Uint8Array(1 + L.length + len), i = 0; o[i++] = h; L.forEach(function (x) { o[i++] = x; }); parts.forEach(function (p) { o.set(p, i); i += p.length; }); return o; }
+    function Broker(url) {
+      var B = { url: url, st: 'wait', ws: null, buf: new Uint8Array(0), pid: 1, tries: 0, last: 0, ping: 0, rt: 0, ok: 0, err: '' };
+      B.name = (String(url).match(/^wss?:\/\/([^/:]+)/i) || [0, url])[1];
+      function send(u8) { try { if (B.ws && B.ws.readyState === 1) { B.ws.send(u8); return true; } } catch (e) { } return false; }
+      function subOne(t) { var id = (B.pid = (B.pid % 65000) + 1); send(pkt(0x82, [new Uint8Array([id >> 8, id & 255]), str(t), new Uint8Array([0])])); }
+      B.sub = function (t) { if (B.st === 'open') subOne(t); };
+      B.pub = function (t, payload, retain) { if (B.st !== 'open') return false; return send(pkt(0x30 | (retain ? 1 : 0), [str(t), te.encode(payload)])); };
+      function onPkt(type, flags, body) {
+        if (type === 2) { if (body[1] === 0) { B.st = 'open'; B.tries = 0; B.ok = Date.now(); B.err = ''; Object.keys(subs).forEach(subOne); emit(); } else { B.err = 'رفض الخادم'; try { B.ws.close(); } catch (e) { } } return; }
+        if (type === 3) { var tl = (body[0] << 8) | body[1], topic = td.decode(body.slice(2, 2 + tl)), off = 2 + tl; if (((flags >> 1) & 3) > 0) off += 2; var pl = td.decode(body.slice(off)); if (!pl) return; kit.dec(pl).then(function (o) { deliver(topic, o, { via: 'mqtt', b: B.name, retained: !!(flags & 1) }); }, function () { }); }
+      }
+      function feed(u8) { var a = new Uint8Array(B.buf.length + u8.length); a.set(B.buf); a.set(u8, B.buf.length); B.buf = a; while (B.buf.length >= 2) { var mul = 1, len = 0, i = 1, d; do { if (i >= B.buf.length) return; d = B.buf[i++]; len += (d & 127) * mul; mul *= 128; } while (d & 128 && i < 5); if (B.buf.length < i + len) return; var h = B.buf[0]; onPkt(h >> 4, h & 15, B.buf.slice(i, i + len)); B.buf = B.buf.slice(i + len); } }
+      B.connect = function () {
+        if (closed) return; clearTimeout(B.rt); B.st = 'wait'; B.buf = new Uint8Array(0); var ws;
+        try { ws = new WebSocket(url, ['mqtt']); } catch (e) { B.err = e.message; return retry(); }
+        B.ws = ws; ws.binaryType = 'arraybuffer';
+        var to = setTimeout(function () { if (B.st !== 'open') { B.err = 'انتهت المهلة'; try { ws.close(); } catch (e) { } } }, 9000);
+        ws.onopen = function () { var cid = 'rev' + Math.random().toString(36).slice(2, 12); send(pkt(0x10, [new Uint8Array([0, 4, 77, 81, 84, 84, 4, 2, 0, 40]), str(cid)])); };
+        ws.onmessage = function (ev) { B.last = Date.now(); if (ev.data instanceof ArrayBuffer) feed(new Uint8Array(ev.data)); };
+        ws.onerror = function () { B.err = B.err || 'تعذّر الاتصال'; };
+        ws.onclose = function () { clearTimeout(to); var was = B.st === 'open'; B.st = closed ? 'off' : 'err'; if (B.ws === ws) B.ws = null; emit(); if (!closed) retry(was); };
+      };
+      function retry(was) { B.tries++; var ms = was ? 800 : Math.min(20000, 1200 * Math.pow(1.6, Math.min(B.tries, 8))); B.rt = setTimeout(B.connect, ms); }
+      B.tick = function () { if (B.st !== 'open') return; var now = Date.now(); if (now - B.ping > 20000) { B.ping = now; send(new Uint8Array([0xC0, 0])); } if (B.last && now - B.last > 65000) { try { B.ws.close(); } catch (e) { } } };
+      B.close = function () { clearTimeout(B.rt); try { send(new Uint8Array([0xE0, 0])); B.ws && B.ws.close(); } catch (e) { } B.st = 'off'; };
+      return B;
+    }
+    var BR = brokers.map(Broker); BR.forEach(function (b) { b.connect(); });
+    var tk = setInterval(function () { BR.forEach(function (b) { b.tick(); }); }, 5000);
+    function mqttUp() { return BR.filter(function (b) { return b.st === 'open'; }).length; }
+    function ntfySub(topic) {
+      if (!ntfyBase || ntfySubs[topic]) return; var S = ntfySubs[topic] = { stop: false, ctl: null, since: String(Math.floor((OPT.since || Date.now() - 120000) / 1000)), ids: {}, fails: 0 };
+      var flat = topic.replace(/[^A-Za-z0-9_-]/g, '-');
+      (async function run() {
+        while (!S.stop && !closed) {
+          try { S.ctl = new AbortController(); var r = await fetch(ntfyBase + '/' + flat + '/json?since=' + encodeURIComponent(S.since), { signal: S.ctl.signal }); if (!r.ok) throw new Error('HTTP ' + r.status); S.fails = 0; NT.st = 'open'; emit();
+            var rd = r.body && r.body.getReader ? r.body.getReader() : null, dc = new TextDecoder(), buf = '';
+            var handle = function (line) { line = line && line.trim(); if (!line) return; var j; try { j = JSON.parse(line); } catch (e) { return; } if (j.event !== 'message' || !j.message || S.ids[j.id]) return; S.ids[j.id] = 1; if (j.time) S.since = String(j.time); kit.dec(j.message).then(function (o) { deliver(topic, o, { via: 'ntfy' }); }, function () { }); };
+            if (rd) { while (!S.stop) { var x = await rd.read(); if (x.done) break; buf += dc.decode(x.value, { stream: true }); var p = buf.split('\n'); buf = p.pop(); p.forEach(handle); } } else { (await r.text()).split('\n').forEach(handle); }
+          } catch (e) { if (S.stop || closed) return; S.fails++; NT.st = 'err'; NT.err = e.message; emit(); }
+          if (!S.stop) await new Promise(function (r) { setTimeout(r, Math.min(20000, 1500 * (S.fails + 1))); });
+        }
+      })();
+    }
+    async function ntfyPub(topic, body) { if (!ntfyBase) throw new Error('لا يوجد مسار احتياطي'); if (body.length > 3900) throw new Error('الرسالة أكبر من حد المسار الاحتياطي'); var r = await fetch(ntfyBase + '/' + topic.replace(/[^A-Za-z0-9_-]/g, '-'), { method: 'POST', body: body }); if (!r.ok) throw new Error('HTTP ' + r.status); return true; }
+    async function pub(topic, obj, o) {
+      o = o || {}; if (closed) throw new Error('الناقل مغلق'); obj._u = obj._u || rid();
+      var body = await kit.enc(obj), sent = 0; BR.forEach(function (b) { if (b.pub(pref + topic, body, !!o.retain)) sent++; });
+      if (o.retain) return sent > 0;
+      if (ntfyBase && (ntfyMode === 'always' || (!sent && ntfyMode !== 'off')) && body.length <= 3900) { try { await ntfyPub(pref + topic, body); sent++; } catch (e) { } }
+      if (!sent) throw new Error('لا يوجد مسار اتصال متاح الآن'); return true;
+    }
+    function sub(topic, fn) { var full = pref + topic; (subs[full] = subs[full] || []).push(fn); if (subs[full].length === 1) BR.forEach(function (b) { b.sub(full); }); if (ntfyBase && ntfyMode !== 'off') ntfySub(full); return function () { subs[full] = (subs[full] || []).filter(function (x) { return x !== fn; }); }; }
+    function status() { var up = mqttUp(); return { mqtt: BR.map(function (b) { return { name: b.name, st: b.st, err: b.err }; }), up: up, ntfy: NT.st, live: up > 0 || NT.st === 'open' }; }
+    function close() { closed = true; clearInterval(tk); BR.forEach(function (b) { b.close(); }); Object.keys(ntfySubs).forEach(function (k) { var s = ntfySubs[k]; s.stop = true; try { s.ctl && s.ctl.abort(); } catch (e) { } }); }
+    return { pub: pub, sub: sub, status: status, onStatus: function (f) { listeners.push(f); }, close: close, clearRetained: function (t) { BR.forEach(function (b) { if (b.st === 'open') b.pub(pref + t, '', true); }); } };
+  }
+(function pApp(CFG) {
+    if (CFG && CFG.hashCfg) { try { var hs = String(location.hash || '').replace(/^#/, '').replace(/-/g, '+').replace(/_/g, '/'), bin = atob(hs + '==='.slice((hs.length + 3) % 4)), u8 = new Uint8Array(bin.length); for (var hi = 0; hi < bin.length; hi++) u8[hi] = bin.charCodeAt(hi); CFG = Object.assign({}, JSON.parse(new TextDecoder().decode(u8)), { logo: CFG.logo || '' }); } catch (e) { CFG = {}; } if (!CFG.t || !CFG.k) { document.body.style.cssText = 'margin:0;background:#041a24;color:#fff;font-family:Cairo,Tahoma,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center;padding:20px'; document.body.innerHTML = '<div><h2>القاعة الافتراضية</h2><p>رابط الدعوة غير مكتمل — افتح الرابط كما وصلك كاملًا.</p></div>'; return; } }
+    if (!(window.crypto && crypto.subtle && window.isSecureContext)) { document.body.style.cssText = 'margin:0;background:#041a24;color:#fff;font-family:Cairo,Tahoma,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center;padding:20px'; if (CFG.su) { document.body.innerHTML = '<div><h2>🔒 جارٍ فتح القاعة الآمنة…</h2><p>إن لم تُفتح تلقائيًا اضغط الزر.</p><a href="' + CFG.su.replace(/"/g, '&quot;') + '" style="display:inline-block;margin-top:10px;background:#e8d9a8;color:#05202b;border-radius:14px;padding:12px 22px;font-weight:900;text-decoration:none">فتح القاعة</a></div>'; setTimeout(function () { location.href = CFG.su; }, 900); } else document.body.innerHTML = '<div><h2>القاعة الافتراضية</h2><p>افتح ملف الدعوة في متصفح Chrome أو Safari أو Edge مباشرة، أو اطلب الرابط الآمن من أمانة الجلسة.</p></div>'; return; }
+    var d = document, $ = function (s, el) { return (el || d).querySelector(s); }, $$ = function (s, el) { return [].slice.call((el || d).querySelectorAll(s)); };
+
+    /* v414: على الملفات المحلية (file://) لا يحفظ المتصفح إذن الميكروفون، فيسأل مع كل طلب جديد.
+       نحتفظ بنسخة صامتة من مسار الصوت بعد أول موافقة، ونُلبّي كل طلب لاحق بنسخة منها — فلا يتكرر السؤال */
+    (function () { try { var MD = navigator.mediaDevices; if (location.protocol !== 'file:' || !MD || !MD.getUserMedia || MD.__rascGum) return; var G = MD.getUserMedia.bind(MD), BA = null; MD.__rascGum = 1;
+      MD.getUserMedia = async function (c) { c = c || {}; var out = [], live = BA && BA.readyState === 'live';
+        if (c.audio && live) { var t = BA.clone(); t.enabled = true; if (typeof c.audio === 'object') { var cc = Object.assign({}, c.audio); delete cc.deviceId; try { await t.applyConstraints(cc); } catch (e) { } } out.push(t); }
+        var askA = !!c.audio && !live, askV = !!c.video; if (askA || askV) { var s = await G({ audio: askA ? c.audio : false, video: askV ? c.video : false }); s.getTracks().forEach(function (t) { if (t.kind === 'audio') { try { if (BA) BA.stop(); } catch (e) { } BA = t.clone(); BA.enabled = false; } out.push(t); }); }
+        return new MediaStream(out); }; } catch (e) { } })();
+    function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+    function uid() { return 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+    function ls(k, v) { try { if (v === undefined) return localStorage.getItem('rev_' + CFG.t + '_' + k); localStorage.setItem('rev_' + CFG.t + '_' + k, v); } catch (e) { return null; } }
+    var AR_MON = ['يناير', 'فبراير', 'مارس', 'أبريل', 'مايو', 'يونيو', 'يوليو', 'أغسطس', 'سبتمبر', 'أكتوبر', 'نوفمبر', 'ديسمبر'], AR_DAYS = ['الأحد', 'الاثنين', 'الثلاثاء', 'الأربعاء', 'الخميس', 'الجمعة', 'السبت'];
+    function D(s) { var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(s || '')); return m ? new Date(+m[1], +m[2] - 1, +m[3]) : null; }
+    function t12(t) { var m = /^(\d{1,2}):(\d{2})/.exec(String(t || '')); if (!m) return ''; var h = +m[1]; return (h % 12 || 12) + ':' + m[2] + ' ' + (h < 12 ? 'ص' : 'م'); }
+    function hij(dt) { try { return new Intl.DateTimeFormat('ar-SA-u-ca-islamic-umalqura', { day: 'numeric', month: 'long', year: 'numeric' }).format(dt); } catch (e) { return ''; } }
+    var LX = Object.assign({ hall: 'القاعة الافتراضية للفعاليات', kind: 'فعالية علمية', spk: 'المتحدثون', agenda: 'محاور الفعالية وبرنامجها', tabAgenda: 'المحاور', nameHint: 'الاسم الكامل (كما تريده في الشهادة) *', privacy: 'بياناتك تُرسل مشفّرة إلى منظّمي الفعالية فقط، وتُستخدم لتوثيق الحضور وإصدار الشهادة.', cats: ['عضو هيئة تدريس', 'طالب دراسات عليا', 'طالب', 'إداري', 'باحث', 'ضيف', 'متحدث'], catLbl: 'الصفة', deptLbl: 'الجهة / القسم', host: 'المنظّم', qaHint: 'اطرح سؤالك على المتحدثين، وصوّت لأسئلة الآخرين لترتيب أولويتها.', qaPh: 'اكتب سؤالك للمتحدث…', survey: 'تقييم الفعالية', surveySub: 'رأيك يطوّر فعالياتنا القادمة — دقيقة واحدة.', nps: 'ما مدى احتمال أن توصي بفعالياتنا لزملائك؟ (0–10)', ended: 'انتهت الفعالية — شكرًا لحضورك', endNote: '، وتصلك الشهادة من المنظّمين بعد اعتماد الحضور.', liveNow: 'الفعالية منعقدة — ادخل القاعة', spkInv: '🎙 دعوة متحدث', spkWelcome: 'أهلًا بك متحدثًا — ادخل المنصة', join: 'سجّل حضورك وادخل القاعة', soon: 'سيبدأ البث قريبًا', item: 'البند', notesTab: 'المقترحات', noteKinds: ['توصية', 'سؤال', 'مقترح'], noteBtn: 'توصية · سؤال · مقترح', noteTitle: 'مشاركتك على البند', noteHint: 'اضغط على أي بند لكتابة توصية أو سؤال أو مقترح وإرساله إلى غرفة التحكم.', chairLbl: 'رئيس الجلسة', spkNow: 'يتحدث الآن', cur: 'البند الحالي' }, CFG.lx || {});
+    var EV = CFG.ev || {}, ST = { phase: 'pre', agenda: -1, ticker: '', live: false, cnt: 0, lobby: false, chat: true, qa: true, ended: false }, ME = { pid: ls('pid') || uid(), prof: null, admitted: false, stage: false, hand: false, mic: false, cam: false, rtc: 'off', tab: 'agenda', unread: {} };
+    ls('pid', ME.pid);
+    var kit = makeKit(CFG.k), T = CFG.t, bus = makeBus({ brokers: CFG.br || [], ntfy: CFG.b || '', ntfyMode: CFG.nm || 'fallback', since: Date.now() - 60000, prefix: 'rascev/' }, kit);
+    var NOTES = [], CHAT = [], QA = [], POLL = null, MYVOTE = {}, SURVEY = null, CAP = '', capT = 0, OFF = null, MYN = {}; try { MYN = JSON.parse(ls('notes') || '{}') || {}; } catch (e) { MYN = {}; }
+    function KINDS() { return (EV.noteKinds && EV.noteKinds.length ? EV.noteKinds : LX.noteKinds); }
+    function syncClock(st, ok) { if (st && st.now) { var o = Date.now() - st.now; if (ok || OFF == null) OFF = o; } }
+    function mmss(ms) { var neg = ms < 0, s = Math.floor(Math.abs(ms) / 1000), h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return (neg ? '−' : '') + (h ? h + ':' + ('0' + m).slice(-2) : ('0' + m).slice(-2)) + ':' + ('0' + s % 60).slice(-2); }
+    if (!window.crypto || !crypto.subtle) { d.body.innerHTML = '<div style="padding:40px;text-align:center;font-family:Tahoma">المتصفح لا يدعم الاتصال الآمن — افتح الدعوة في Chrome أو Edge أو Safari حديث.</div>'; return; }
+    function send(o) { o.pid = ME.pid; return bus.pub(T + '/u', o).catch(function () { }); }
+    var COL = { teal: '#00728f', deep: '#05202b', gold: '#c8b37c' };
+    var css = [
+      ':root{--t:#00728f;--t2:#19b6d6;--g:#c8b37c;--g2:#a39161;--bg:#041a24;--p:rgba(255,255,255,.06);--l:rgba(255,255,255,.12);--x:#eaf6f9;--m:#93b4bf;--live:#ff4d5e}',
+      '*{box-sizing:border-box}html,body{margin:0;height:100%;background:var(--bg);color:var(--x);font-family:Cairo,"Segoe UI",Tahoma,sans-serif;direction:rtl}button,input,select,textarea{font-family:inherit}',
+      'body{background:radial-gradient(1200px 600px at 90% -10%,#0d6f8a55,transparent),radial-gradient(900px 600px at -10% 110%,#a3916133,transparent),var(--bg)}',
+      '#bgc{position:fixed;inset:0;z-index:0;opacity:.55;pointer-events:none}#app{position:relative;z-index:1;min-height:100%}',
+      '.brand{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.brand img{height:46px;max-width:62%;object-fit:contain;background:#fff;border-radius:12px;padding:4px 8px}.brand b{display:block;font-size:14px}.brand small{color:var(--m);font-size:11.5px}',
+      '.gate{max-width:1180px;margin:0 auto;padding:22px 16px;display:grid;grid-template-columns:1.15fr 1fr;gap:18px}@media(max-width:900px){.gate{grid-template-columns:1fr}}',
+      '.card{background:linear-gradient(160deg,rgba(255,255,255,.08),rgba(255,255,255,.03));border:1px solid var(--l);border-radius:24px;padding:20px;backdrop-filter:blur(10px);box-shadow:0 30px 60px -40px #000}',
+      '.pill{display:inline-flex;gap:6px;align-items:center;border-radius:99px;padding:2px 12px;font-size:12px;font-weight:800;background:linear-gradient(135deg,#e8d9a8,#a39161);color:#2a220d}',
+      'h1.tt{font-size:clamp(22px,3.2vw,34px);line-height:1.45;margin:12px 0 6px;font-weight:900;background:linear-gradient(90deg,#fff,#d9f3f9 60%,#e8d9a8);-webkit-background-clip:text;background-clip:text;color:transparent}',
+      '.sub{color:#cfe3ea;font-size:14px}.meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin:14px 0}.meta div{background:var(--p);border:1px solid var(--l);border-radius:14px;padding:8px 12px;font-size:12.5px}.meta b{display:block;color:var(--g);font-size:11px}',
+      '.cd{display:flex;gap:8px;margin:10px 0}.cd div{flex:1;text-align:center;background:rgba(0,0,0,.25);border:1px solid var(--l);border-radius:14px;padding:6px}.cd b{display:block;font-size:24px;font-variant-numeric:tabular-nums}.cd small{color:var(--m);font-size:10.5px}',
+      '.ag{list-style:none;margin:8px 0 0;padding:0}.ag li{display:flex;gap:10px;padding:8px 10px;border-radius:12px;border:1px solid transparent;font-size:13px}.ag li .tm{color:var(--g);font-weight:800;min-width:92px;direction:ltr;text-align:right;font-size:12px}.ag li small{display:block;color:var(--m)}.ag li.now{background:linear-gradient(90deg,rgba(25,182,214,.18),transparent);border-color:rgba(25,182,214,.5)}.ag li.now .tm:before{content:"● ";color:var(--live)}',
+      '.sp{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.sp span{background:var(--p);border:1px solid var(--l);border-radius:99px;padding:3px 12px;font-size:12px}',
+      'label.f{display:block;font-size:12px;font-weight:800;margin:8px 0 3px;color:#cfe3ea}input.i,select.i,textarea.i{width:100%;background:rgba(0,0,0,.28);border:1px solid var(--l);border-radius:12px;padding:10px 12px;color:#fff;font-size:14px;outline:0}input.i:focus,select.i:focus,textarea.i:focus{border-color:var(--t2);box-shadow:0 0 0 3px rgba(25,182,214,.2)}select.i option{background:#06222e;color:#eaf6f9}',
+      '.dev{display:grid;grid-template-columns:150px 1fr;gap:10px;align-items:center;margin-top:10px}.dev video{width:150px;aspect-ratio:4/3;object-fit:cover;border-radius:14px;background:#000;transform:scaleX(-1)}.tg{display:flex;gap:8px;align-items:center;padding:8px 10px;border-radius:12px;background:var(--p);border:1px solid var(--l);margin-bottom:6px;cursor:pointer;font-size:13px}.tg input{width:18px;height:18px}.lvl{height:6px;border-radius:9px;background:rgba(255,255,255,.12);overflow:hidden}.lvl i{display:block;height:100%;width:0;background:linear-gradient(90deg,#4fd1a5,#c8b37c)}',
+      '.btn{border:0;border-radius:14px;padding:12px 18px;font-weight:900;font-size:15px;cursor:pointer;color:#05202b;background:linear-gradient(135deg,#e8d9a8,#a39161);box-shadow:0 14px 30px -18px #000;width:100%;margin-top:12px}.btn:disabled{opacity:.6}.note{color:var(--m);font-size:11.5px;line-height:1.8;margin-top:8px}',
+      '.wait{min-height:100vh;display:flex;align-items:center;justify-content:center;text-align:center;padding:20px}.ring{width:120px;height:120px;border-radius:50%;margin:0 auto 18px;border:3px solid rgba(25,182,214,.25);border-top-color:var(--t2);animation:sp 1.2s linear infinite}@keyframes sp{to{transform:rotate(360deg)}}',
+      '.hall{display:grid;grid-template-rows:auto 1fr auto;height:100vh;height:100dvh}.top{display:flex;align-items:center;gap:10px;padding:8px 14px;background:rgba(3,20,28,.72);border-bottom:1px solid var(--l);backdrop-filter:blur(10px)}.top .tt2{flex:1;min-width:0}.top .tt2 b{display:block;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.top .tt2 small{color:var(--m);font-size:11px}',
+      '.live{display:inline-flex;align-items:center;gap:6px;background:var(--live);color:#fff;border-radius:99px;padding:2px 10px;font-weight:900;font-size:12px}.live i{width:8px;height:8px;border-radius:50%;background:#fff;animation:bl 1s infinite}@keyframes bl{50%{opacity:.3}}.off{background:#3b5662}',
+      '.hall{grid-template-columns:minmax(0,1fr)}.main{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:10px;padding:10px;min-height:0;min-width:0}@media(max-width:980px){.main{grid-template-columns:minmax(0,1fr);grid-template-rows:auto minmax(0,1fr);padding:6px;gap:6px}}html,body{overflow-x:hidden}@media(max-width:520px){.bar .cb{width:44px;height:44px;font-size:17px}.hall .bar{gap:5px;padding:8px 4px;flex-wrap:nowrap}.top{padding:6px 8px;gap:6px}.top img{display:none}.gate{padding:12px 10px}.card{padding:14px;border-radius:18px}.dev{grid-template-columns:110px 1fr}.dev video{width:110px}}',
+      '.stage{position:relative;background:#000;border-radius:18px;overflow:hidden;display:flex;align-items:center;justify-content:center;min-height:200px;border:1px solid var(--l)}.stage video,.stage img{width:100%;height:100%;object-fit:contain;max-height:calc(100dvh - 205px)}@media(max-width:980px){.stage{aspect-ratio:16/9}.stage video,.stage img{max-height:none}}',
+      '.cap{position:absolute;bottom:12%;left:6%;right:6%;text-align:center;font-size:clamp(14px,2vw,22px);font-weight:800;text-shadow:0 2px 6px #000;background:rgba(0,0,0,.45);border-radius:12px;padding:6px 12px;display:none}',
+      '.tick{position:absolute;top:10px;left:10px;right:10px;background:linear-gradient(90deg,#a39161,#c8b37c);color:#2a220d;font-weight:900;border-radius:10px;padding:5px 12px;font-size:13px;display:none}',
+      '.ph{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;text-align:center;padding:20px;background:radial-gradient(600px 300px at 50% 40%,#0d6f8a66,transparent)}.ph img{max-width:min(520px,80%);max-height:60%;object-fit:contain;border-radius:14px;box-shadow:0 20px 50px -20px #000}',
+      '.rx{position:absolute;inset:0;pointer-events:none;overflow:hidden}.rx span{position:absolute;bottom:-40px;font-size:30px;animation:up 3.2s ease-out forwards}@keyframes up{to{transform:translateY(-110vh) scale(1.4);opacity:0}}',
+      '.side{display:flex;flex-direction:column;background:linear-gradient(160deg,rgba(255,255,255,.07),rgba(255,255,255,.02));border:1px solid var(--l);border-radius:18px;min-height:0;overflow:hidden}.tabs{display:flex;border-bottom:1px solid var(--l)}.tabs button{flex:1;background:transparent;border:0;color:var(--m);padding:10px 4px;font-weight:800;font-size:12.5px;cursor:pointer;position:relative}.tabs button.on{color:#fff;box-shadow:inset 0 -3px 0 var(--g)}.tabs button em{position:absolute;top:4px;left:8px;background:var(--live);color:#fff;border-radius:99px;font-style:normal;font-size:10px;padding:0 6px}',
+      '.pane{flex:1;overflow:auto;padding:10px}.msg{margin-bottom:8px}.msg b{font-size:12px;color:var(--g)}.msg div{background:var(--p);border:1px solid var(--l);border-radius:12px;padding:6px 10px;font-size:13px;line-height:1.7;word-break:break-word}.msg.me div{background:rgba(25,182,214,.15);border-color:rgba(25,182,214,.4)}.msg.h div{background:rgba(200,179,124,.18);border-color:rgba(200,179,124,.5)}',
+      '.inp{display:flex;gap:6px;padding:8px;border-top:1px solid var(--l)}.inp input{flex:1}.inp button{border:0;border-radius:12px;padding:0 14px;font-weight:900;background:var(--t);color:#fff;cursor:pointer}',
+      '.q{background:var(--p);border:1px solid var(--l);border-radius:12px;padding:8px 10px;margin-bottom:6px;font-size:13px}.q.ans{border-color:#4fd1a5}.q.pin{border-color:var(--g);box-shadow:0 0 0 2px rgba(200,179,124,.25)}.q small{color:var(--m)}.q button{float:left;border:1px solid var(--l);background:transparent;color:#fff;border-radius:99px;padding:1px 10px;cursor:pointer;font-size:12px}.q button.on{background:var(--t);border-color:var(--t)}',
+      '.poll h4{margin:4px 0 10px;font-size:15px}.opt{display:block;width:100%;text-align:right;border:1px solid var(--l);background:var(--p);color:#fff;border-radius:12px;padding:10px 12px;margin-bottom:6px;cursor:pointer;position:relative;overflow:hidden;font-size:13.5px;font-weight:700}.opt i{position:absolute;inset:0 auto 0 0;background:rgba(25,182,214,.25);z-index:0}.opt span{position:relative;z-index:1}.opt.mine{border-color:var(--g)}.opt em{float:left;position:relative;z-index:1;font-style:normal;color:var(--g)}',
+      '.bar{position:relative;z-index:4;display:flex;gap:8px;justify-content:center;align-items:center;padding:10px;background:rgba(3,20,28,.8);border-top:1px solid var(--l);flex-wrap:wrap}.cb{width:52px;height:52px;border-radius:50%;border:1px solid var(--l);background:rgba(255,255,255,.08);color:#fff;font-size:20px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:.15s}.cb:hover{background:rgba(255,255,255,.16)}.cb.on{background:var(--t);border-color:var(--t)}.cb.red{background:var(--live);border-color:var(--live)}.cb:disabled{opacity:.35;cursor:not-allowed}.cb small{display:none}',
+      '.rxp{display:none;position:absolute;bottom:74px;left:50%;transform:translateX(-50%);z-index:6;box-shadow:0 18px 40px -16px #000;background:#06222e;border:1px solid var(--l);border-radius:16px;padding:6px;gap:4px}.rxp.on{display:flex}.rxp button{font-size:26px;background:transparent;border:0;cursor:pointer;padding:4px}',
+      '.self{position:absolute;top:12px;left:12px;width:min(28%,180px);aspect-ratio:4/3;border-radius:12px;overflow:hidden;border:2px solid var(--g);display:none;background:#000}.self video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}',
+      '.toast{position:fixed;bottom:90px;left:50%;transform:translateX(-50%);background:#06303d;border:1px solid var(--t2);color:#fff;border-radius:14px;padding:10px 16px;font-weight:800;z-index:9;box-shadow:0 20px 40px -20px #000;max-width:90vw;text-align:center}',
+      '.mod{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:20;display:flex;align-items:center;justify-content:center;padding:14px}.mod .card{width:min(560px,100%);max-height:92vh;overflow:auto}.stars{display:flex;gap:4px;direction:ltr;justify-content:flex-end}.stars button{background:transparent;border:0;font-size:26px;cursor:pointer;color:#3b5662}.stars button.on{color:#f2c45a}',
+      '.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#f2b84b}.dot.ok{background:#4fd1a5}.dot.bad{background:#ff7b72}',
+      '.top .spk{position:relative;top:auto;left:auto;transform:none;display:none;max-width:44%;padding:4px 14px 4px 8px;flex:none;margin-inline:6px}.top .spk.on{display:flex;transform:none;opacity:1}.top .spk .mic{width:26px;height:26px;font-size:13px}.top .spk b{font-size:clamp(13px,1.5vw,17px)}@media(max-width:620px){.top{flex-wrap:wrap}.top .spk{order:9;flex-basis:100%;max-width:100%;justify-content:center;margin:2px 0 0}}',
+      '.sg{position:absolute;inset:0;z-index:7;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.35)}.sg.on{display:flex}.sg button{border:0;border-radius:99px;padding:14px 26px;font-size:17px;font-weight:900;color:#05202b;background:linear-gradient(135deg,#ffe9a8,#c8b37c);box-shadow:0 0 0 0 rgba(255,233,168,.6);animation:sgp 1.4s infinite;cursor:pointer;font-family:inherit}@keyframes sgp{0%{box-shadow:0 0 0 0 rgba(255,233,168,.55)}70%{box-shadow:0 0 0 18px rgba(255,233,168,0)}100%{box-shadow:0 0 0 0 rgba(255,233,168,0)}}',
+      '.cb.dim{opacity:.55}.cb .lb{position:absolute;bottom:-15px;font-size:9.5px;font-weight:800;color:var(--m);white-space:nowrap}.cb{position:relative}@media(max-width:520px){.cb .lb{display:none}}',
+      '.atb{position:fixed;top:64px;left:50%;transform:translateX(-50%);z-index:12;max-width:min(560px,94vw);background:linear-gradient(135deg,#3a2a08,#5a4210);border:1px solid #e8d9a8;color:#fff;border-radius:14px;padding:10px 16px;font-weight:800;font-size:13.5px;box-shadow:0 18px 40px -16px #000;display:flex;gap:10px;align-items:center;animation:atb .3s}.atb button{border:0;border-radius:10px;padding:5px 12px;font-weight:900;cursor:pointer;background:#e8d9a8;color:#2a220d;font-family:inherit;white-space:nowrap}@keyframes atb{from{opacity:0;transform:translate(-50%,-10px)}}',
+      '.chk .cd2{font-size:40px;font-weight:900;color:var(--g);font-variant-numeric:tabular-nums}.chk .btn{font-size:18px;padding:16px}.ateye{font-size:11px;color:#9fd8c4;border:1px solid rgba(79,209,165,.4);border-radius:99px;padding:1px 8px;white-space:nowrap}',
+      '.nt2{background:var(--p);border:1px solid var(--l);border-radius:12px;padding:8px 10px;margin-bottom:6px;font-size:13px;line-height:1.75}.nt2 .k{display:inline-block;font-size:10.5px;font-weight:900;border-radius:99px;padding:0 8px;background:var(--t);color:#fff;margin-inline-end:6px}.nt2 button{float:left;border:1px solid var(--l);background:transparent;color:#fff;border-radius:99px;padding:2px 10px;cursor:pointer;font-size:12px;font-family:inherit}.nt2 button.on{background:var(--t);border-color:var(--t)}.nt2 small{color:var(--m)}.nt2 .rs{color:var(--g);font-size:11.5px;margin-top:3px}',
+      '.inv{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}.inv button{border:1px solid var(--l);border-radius:14px;padding:14px 8px;font-size:15px;font-weight:900;cursor:pointer;color:#fff;background:var(--t);font-family:inherit}.inv button.c2{background:rgba(255,255,255,.08)}',
+      '::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-track{background:rgba(0,0,0,.25);border-radius:10px}::-webkit-scrollbar-thumb{background:linear-gradient(180deg,#19b6d6,#00728f 55%,#a39161);border-radius:10px;border:2px solid #05202b;min-height:40px}::-webkit-scrollbar-thumb:hover{background:linear-gradient(180deg,#5fdcf0,#0a8fb0 55%,#c8b37c)}::-webkit-scrollbar-corner{background:transparent}@supports (-moz-appearance:none){*{scrollbar-width:thin;scrollbar-color:#1590ad rgba(0,0,0,.25)}}',
+      '.hall{grid-template-rows:auto auto minmax(0,1fr) auto}.agb{display:block;min-width:0}.agb .in{display:flex;align-items:center;gap:10px;padding:7px 14px;background:linear-gradient(90deg,rgba(0,114,143,.35),rgba(3,20,28,.6));border-bottom:1px solid var(--l);font-size:13px;min-width:0}.agb .nm{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:800}.agb .nm small{color:var(--g);font-weight:900;margin-inline-end:6px}.agb .tm{font-weight:900;font-variant-numeric:tabular-nums;font-size:15px;white-space:nowrap;direction:ltr}.agb .pb{height:4px;background:rgba(255,255,255,.1)}.agb .pb i{display:block;height:100%;width:0;background:linear-gradient(90deg,#19b6d6,#4fd1a5);transition:width .9s linear}.agb.w .pb i{background:linear-gradient(90deg,#c88a12,#f2c45a)}.agb.w .tm{color:#f2c45a}.agb.x .pb i{background:var(--live)}.agb.x .tm{color:#ff8a95;animation:bl 1.2s infinite}.agb .lf{font-size:11.5px;color:var(--m);white-space:nowrap}.agb .ch{font-size:11.5px;color:#e8d9a8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:34%}@media(max-width:620px){.agb .in{flex-wrap:wrap;gap:4px 10px;padding:6px 10px}.agb .nm{flex-basis:100%}.agb .ch{max-width:100%}}',
+      '.spk{position:absolute;top:12px;left:50%;transform:translateX(-50%) translateY(-8px);z-index:5;display:flex;align-items:center;gap:10px;max-width:86%;padding:7px 18px 7px 12px;border-radius:99px;background:linear-gradient(135deg,rgba(10,42,54,.92),rgba(5,32,43,.92));border:1.5px solid #e8d9a8;color:#fff;opacity:0;pointer-events:none;transition:opacity .35s,transform .35s;box-shadow:0 0 0 0 rgba(232,217,168,.6),0 0 24px rgba(232,217,168,.45);white-space:nowrap}.spk.on{opacity:1;transform:translateX(-50%) translateY(0);animation:glow 1.6s ease-in-out infinite}.spk .mic{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;background:radial-gradient(circle,#ffe9a8,#c8b37c);color:#2a220d;font-size:15px;flex:none;animation:pul 1s ease-in-out infinite}.spk .tx{min-width:0;overflow:hidden;text-overflow:ellipsis}.spk small{display:block;font-size:10.5px;color:#e8d9a8;font-weight:800;letter-spacing:.3px}.spk b{font-size:clamp(14px,1.8vw,19px);font-weight:900;background:linear-gradient(90deg,#fff,#ffe9a8,#fff);background-size:200% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;animation:shn 2.4s linear infinite}.spk em{font-style:normal;color:#b8d7e0;font-size:11.5px;margin-inline-start:6px}@keyframes glow{0%,100%{box-shadow:0 0 0 0 rgba(232,217,168,.55),0 0 18px rgba(232,217,168,.35)}50%{box-shadow:0 0 0 7px rgba(232,217,168,0),0 0 34px rgba(255,233,168,.75)}}@keyframes pul{50%{transform:scale(1.12)}}@keyframes shn{to{background-position:-200% 0}}',
+      '.ag li.nt{cursor:pointer;align-items:flex-start;flex-wrap:wrap;row-gap:6px}.ag li.nt .tm{min-width:58px}.ag li.nt>div{flex:1 1 150px!important}.ag li.nt:hover{background:rgba(255,255,255,.05);border-color:var(--l)}.ag .nb{margin-inline-start:auto;flex:none;align-self:center;border:1px solid var(--l);background:rgba(25,182,214,.12);color:#cfeaf2;border-radius:99px;padding:2px 10px;font-size:11px;font-weight:800;cursor:pointer;white-space:nowrap}.ag .nb em{font-style:normal;background:var(--g);color:#2a220d;border-radius:99px;padding:0 6px;margin-inline-start:4px}.kd{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}.kd button{flex:1;min-width:90px;border:1px solid var(--l);background:var(--p);color:#fff;border-radius:12px;padding:8px;font-weight:900;cursor:pointer}.kd button.on{background:var(--t);border-color:var(--t2)}',
+      /* v413: شاشة مشارك مدمجة ومنظّمة — اسم المتحدث في شريحة صغيرة بالوميض نفسه، شريط البند سطر واحد، نص تحت كل أيقونة */
+      '.top{padding:6px 14px;gap:10px;min-height:50px;box-sizing:border-box}.top .tt2 b{font-size:14.5px}.top .tt2 small{font-size:11px}' +
+      '.top .spk{padding:2px 12px 2px 4px;gap:7px;max-width:40%;border-width:1px;margin-inline:4px}.top .spk .mic{width:22px;height:22px;font-size:11px}.top .spk .tx{display:flex;align-items:baseline;gap:6px;white-space:nowrap}.top .spk small{display:inline;font-size:10px;letter-spacing:0}.top .spk b{font-size:13px;line-height:1.5}.top .spk em{font-size:10.5px;margin:0}' +
+      '@keyframes glow{0%,100%{box-shadow:0 0 0 0 rgba(232,217,168,.5),0 0 10px rgba(232,217,168,.3)}50%{box-shadow:0 0 0 4px rgba(232,217,168,0),0 0 20px rgba(255,233,168,.65)}}' +
+      '@media(max-width:620px){.top .spk{max-width:100%;padding:2px 10px 2px 4px;margin:3px 0 0}.top .spk em{overflow:hidden;text-overflow:ellipsis}}' +
+      '.agb .in{padding:5px 14px;gap:10px;font-size:12.5px}.agb .tm{font-size:13.5px}.agb .pb{height:3px}@media(max-width:620px){.agb .in{padding:5px 10px;gap:3px 8px}}' +
+      '.ag li{padding:6px 9px}.ag li.done{opacity:.72}.ag li.done .tm:after{content:" ✓";color:#4fd1a5;font-weight:900}.ag li.done b{color:#b9cfd7}' +
+      '.tabs button{padding:9px 2px;font-size:12px;white-space:nowrap}@media(max-width:1100px){.tabs button{font-size:11.5px}}.tabs button em{top:2px;left:3px;font-size:9.5px;padding:0 5px;line-height:15px}.top .tt2 small{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+      '.hall .bar{padding:8px 10px 22px;gap:10px}.bar .cb{width:46px;height:46px;font-size:18px}.cb .lb{display:block!important;position:absolute;top:calc(100% + 2px);bottom:auto;left:50%;transform:translateX(-50%);font-size:10px;font-weight:800;color:#b8d0da;white-space:nowrap;pointer-events:none;line-height:1.2}.cb .ls{display:none}.cb.on .lb,.cb.red .lb{color:#fff}' +
+      '@media(max-width:520px){.hall .bar{gap:4px;padding:6px 2px 20px;justify-content:space-around}.bar .cb{width:42px;height:42px;font-size:16px}.cb .lb{font-size:9.5px}.cb .lf{display:none}.cb .ls{display:inline}}' +
+      '#rxp{bottom:calc(100% + 6px)}','.cb.go{background:#c8a24a;border-color:#ffe9a8;animation:pul 1s ease-in-out infinite}.cb.go .lb{color:#ffe9a8}',
+      /* v414: النصاب في شريط البند تحت الشعار · خط أصغر قليلًا · شريحة المتحدث أكبر قليلًا */
+      '.agb .qo{flex:none;font-size:11.5px;font-weight:900;border-radius:7px;padding:2px 9px;background:rgba(61,45,13,.85);color:#f2c45a;white-space:nowrap}.agb .qo.ok{background:rgba(15,61,47,.85);color:#4fd1a5}' +
+      '.top .tt2 b{font-size:13.5px}.top .tt2 small{font-size:10.5px}.agb .in{font-size:12px}.agb .tm{font-size:13px}.agb .ch,.agb .lf{font-size:11px}.tabs button{font-size:11.5px}' +
+      '.pane{font-size:12.5px}.ag li{font-size:12.5px}.ag li .tm{font-size:12px}.ag .nb{font-size:10.5px}.note{font-size:11.5px}.msg div,.q b,.nt2{font-size:12.5px}.poll h4{font-size:13.5px}.poll .opt{font-size:12.5px}.cb .lb{font-size:9.5px}' +
+      '.main{grid-template-columns:minmax(0,1fr) 318px;gap:8px;padding:8px 8px 6px}@media(max-width:980px){.main{grid-template-columns:minmax(0,1fr);padding:4px;gap:5px}}.stage{border-radius:14px}' +
+      '.top .spk{padding:3px 14px 3px 5px;gap:8px;max-width:44%}.top .spk .mic{width:26px;height:26px;font-size:13px}.top .spk small{font-size:10.5px}.top .spk b{font-size:15px}.top .spk em{font-size:11px}@media(max-width:620px){.top .spk b{font-size:14px}}'
+    ].join('');
+    var st = d.createElement('style'); st.textContent = css; d.head.appendChild(st);
+    /* خلفية نجوم متحركة خفيفة */
+    (function () { var c = d.createElement('canvas'); c.id = 'bgc'; d.body.insertBefore(c, d.body.firstChild); var x = c.getContext('2d'), P = [], W, H; function sz() { W = c.width = innerWidth; H = c.height = innerHeight; } sz(); addEventListener('resize', sz); for (var i = 0; i < 60; i++) P.push({ x: Math.random() * W, y: Math.random() * H, vx: (Math.random() - .5) * .25, vy: (Math.random() - .5) * .25 }); (function f() { if (window.__rvBgOff) { x.clearRect(0, 0, W, H); c.style.display = 'none'; return; } requestAnimationFrame(f); x.clearRect(0, 0, W, H); P.forEach(function (p) { p.x += p.vx; p.y += p.vy; if (p.x < 0 || p.x > W) p.vx *= -1; if (p.y < 0 || p.y > H) p.vy *= -1; }); for (var a = 0; a < P.length; a++) for (var b = a + 1; b < P.length; b++) { var dx = P[a].x - P[b].x, dy = P[a].y - P[b].y, dd = Math.sqrt(dx * dx + dy * dy); if (dd < 140) { x.strokeStyle = 'rgba(140,210,230,' + (1 - dd / 140) * .25 + ')'; x.beginPath(); x.moveTo(P[a].x, P[a].y); x.lineTo(P[b].x, P[b].y); x.stroke(); } } P.forEach(function (p) { x.fillStyle = 'rgba(255,255,255,.7)'; x.fillRect(p.x, p.y, 1.6, 1.6); }); })(); })();
+    var app = d.createElement('div'); app.id = 'app'; d.body.appendChild(app);
+    function toast(m) { var t = d.createElement('div'); t.className = 'toast'; t.textContent = m; d.body.appendChild(t); setTimeout(function () { t.remove(); }, 3800); }
+    function startMs() { var dt = D(EV.date); if (!dt) return 0; var m = /^(\d{1,2}):(\d{2})/.exec(EV.start || '09:00') || [0, 9, 0]; dt.setHours(+m[1], +m[2], 0, 0); return dt.getTime(); }
+    function agendaHtml(nt) { var t = (function () { var m = /^(\d{1,2}):(\d{2})/.exec(EV.start || ''); return m ? +m[1] * 60 + +m[2] : null; })(); return '<ul class="ag">' + (EV.sessions || []).map(function (s, i) { var a = t, b = t != null ? t + (+s.dur || 0) : null; if (t != null) t = b; var f = function (n) { return n == null ? '' : (Math.floor(n / 60) % 24 + ':' + ('0' + n % 60).slice(-2)); }; var nod = !(+s.dur > 0); var mine = MYN[i] || 0; return '<li class="' + (i === ST.agenda ? 'now' : (ST.agenda > i ? 'done' : '')) + (nt ? ' nt' : '') + '"' + (nt ? ' data-ni="' + i + '" title="' + esc(LX.noteHint) + '"' : '') + '><span class="tm">' + (nod ? esc(LX.item) + ' ' + (i + 1) : f(a) + (b != null ? ' – ' + f(b) : '')) + '</span><div style="min-width:0;flex:1"><b>' + esc(s.t) + '</b>' + (s.speaker ? '<small>🎙 ' + esc(s.speaker) + '</small>' : '') + (+s.dur > 0 ? '<small>⏱ ' + (+s.dur) + ' دقيقة</small>' : '') + '</div>' + (nt ? '<button class="nb" data-ni="' + i + '">✍️ ' + esc(LX.noteBtn) + (mine ? '<em>' + mine + '</em>' : '') + '</button>' : '') + '</li>'; }).join('') + '</ul>'; }
+    function brandHtml() { return '<div class="brand">' + (CFG.logo ? '<img src="' + CFG.logo + '" alt="">' : '') + '<div><b>' + esc(EV.org || 'مركز البحوث والدراسات الاستشارية') + '</b><small>' + (/الشرق العربي/.test(EV.org || '') ? '' : 'كليات الشرق العربي · ') + esc(LX.hall) + '</small></div></div>'; }
+
+    /* ───── بوابة الدخول ───── */
+    var PRE = { stream: null, mic: false, cam: false, an: null };
+    function gate() {
+      var dt = D(EV.date), saved = {}; try { saved = JSON.parse(ls('prof') || '{}'); } catch (e) { }
+      app.innerHTML = '<div class="gate"><div class="card">' + brandHtml() + '<div style="margin-top:16px"><span class="pill">' + esc(EV.type || LX.kind) + '</span></div><h1 class="tt">' + esc(EV.title || LX.kind) + '</h1>' + (EV.subtitle ? '<div class="sub">' + esc(EV.subtitle) + '</div>' : '') +
+        '<div class="meta"><div><b>الموعد</b>' + (dt ? AR_DAYS[dt.getDay()] + ' ' + dt.getDate() + ' ' + AR_MON[dt.getMonth()] + ' ' + dt.getFullYear() + '<br><small style="color:var(--m)">' + hij(dt) + '</small>' : 'يُعلن لاحقًا') + '</div><div><b>الوقت</b>' + (EV.start ? t12(EV.start) + (EV.finish ? ' – ' + t12(EV.finish) : '') : '—') + '<br><small style="color:var(--m)">بتوقيت مكة المكرمة</small></div><div><b>الحضور</b>عن بُعد عبر هذه القاعة' + (EV.hours ? '<br><small style="color:var(--m)">' + esc(EV.hours) + ' ساعات</small>' : '') + '</div></div>' +
+        '<div class="cd" id="cd"></div>' + ((EV.speakers || []).length ? '<b style="font-size:13px;color:var(--g)">' + esc(LX.spk) + '</b><div class="sp">' + EV.speakers.map(function (s) { return '<span>🎙 ' + esc((s.title ? s.title + ' ' : '') + s.name) + (s.affil ? ' · ' + esc(s.affil) : '') + '</span>'; }).join('') + '</div>' : '') +
+        ((EV.sessions || []).length ? '<div style="margin-top:14px"><b style="font-size:13px;color:var(--g)">' + esc(LX.agenda) + '</b>' + agendaHtml() + '</div>' : '') + (CFG.poster ? '<img src="' + CFG.poster + '" alt="" style="width:100%;border-radius:16px;margin-top:14px">' : '') + '</div>' +
+        '<div class="card">' + (CFG.role === 'speaker' ? '<span class="pill" style="margin-bottom:8px">' + esc(LX.spkInv) + '</span>' : '') + '<h2 style="margin:0 0 4px;font-size:20px">' + (CFG.role === 'speaker' ? LX.spkWelcome : LX.join) + '</h2><div class="note" style="margin-top:0">' + esc(LX.privacy) + '</div>' +
+        '<label class="f">' + esc(LX.nameHint) + '</label><input class="i" id="fn" value="' + esc(saved.name || '') + '" autocomplete="name"><label class="f">البريد الإلكتروني</label><input class="i" id="fe" type="email" dir="ltr" value="' + esc(saved.email || '') + '" autocomplete="email"><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><div><label class="f">الجوال</label><input class="i" id="fp" type="tel" dir="ltr" value="' + esc(saved.phone || '') + '"></div><div><label class="f">' + esc(LX.catLbl) + '</label><select class="i" id="fc">' + LX.cats.map(function (c) { return '<option' + (saved.cat === c ? ' selected' : '') + '>' + c + '</option>'; }).join('') + '</select></div></div><label class="f">' + esc(LX.deptLbl) + '</label><input class="i" id="fd" value="' + esc(saved.dept || '') + '">' +
+        '<div class="dev"><video id="pv" autoplay playsinline muted></video><div><label class="tg"><input type="checkbox" id="tmic"> 🎙 تفعيل الميكروفون (اختياري)</label><div class="lvl" id="lv"><i></i></div><label class="tg" style="margin-top:6px"><input type="checkbox" id="tcam"> 📷 تفعيل الكاميرا (اختياري)</label><div class="note" style="margin:0">يمكنك الحضور مشاهدًا دون أي منهما؛ يُستخدمان حين يدعوك ' + esc(LX.host) + ' للمداخلة على المنصة.</div></div></div>' +
+        (EV.att && EV.att.lvl && EV.att.lvl !== 'off' ? '<div class="note" style="border:1px solid var(--l);border-radius:12px;padding:8px 10px;background:rgba(79,209,165,.06)">👁 تُطبَّق في هذا ' + esc(LX.kind) + ' <b>متابعة ذكية للانتباه</b>: يُرصد على جهازك فقط بقاء نافذة الاجتماع ظاهرة وفي المقدمة وتشغيل البث وتفاعلك' + (EV.att.lvl === 'adv' ? '، ومع موافقتك داخل القاعة: رصد الحديث الجانبي عبر الميكروفون دون تسجيل' : '') + '. لا تُرسل أي صورة أو صوت — مؤشرات رقمية فقط تظهر لـ' + esc(LX.host) + '.</div>' : '') + '<button class="btn" id="go">🚪 دخول القاعة</button><div class="note" id="net">جارٍ الاتصال بالقاعة… <span class="dot" id="nd"></span></div></div></div>';
+      tickCd(); $('#tmic').onchange = function () { prev(); }; $('#tcam').onchange = function () { prev(); }; secGate(); (function () { var t = $('#tmic'), host = t && (t.closest('label') || t.parentNode); if (host && !$('#mfg')) { var x = d.createElement('div'); x.id = 'mfg'; host.parentNode.insertBefore(x, host.nextSibling); } })(); devPreflight();
+      $('#go').onclick = join; $('#fn').onkeydown = function (e) { if (e.key === 'Enter') join(); };
+    }
+    /* الجوال يمنع الميكروفون/الكاميرا في الملفات المحلية (file/content) — نحوّل إلى الرابط الآمن https إن وُجد */
+    function insecure() { return !window.isSecureContext || !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) || (location.protocol !== 'https:' && !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname) && isMob()); }
+    function isMob() { return /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Mac/.test(navigator.platform)); }
+    function secGate() {
+      if (!insecure()) return; var box = d.createElement('div'); box.className = 'note'; box.style.cssText = 'border:1px solid #e8d9a8;border-radius:12px;padding:10px 12px;background:rgba(232,217,168,.1);color:#fff;font-size:13px';
+      if (CFG.su) { box.innerHTML = '📱 لتعمل <b>الميكروفون والكاميرا</b> على جهازك افتح القاعة عبر الرابط الآمن.<button class="btn" id="goSec" style="margin-top:8px">🔒 فتح القاعة الآمنة</button>'; }
+      else box.innerHTML = '⚠️ فُتحت الدعوة كملف من جهازك، والمتصفح لا يسمح هنا بالميكروفون والكاميرا. يمكنك الحضور ومتابعة البث والدردشة والتصويت، وللتحدث اطلب <b>الرابط الآمن</b> من ' + esc(LX.host) + '.';
+      var go = $('#go'); if (go) go.parentNode.insertBefore(box, go);
+      ['#tmic', '#tcam'].forEach(function (q) { var x = $(q); if (x) { x.disabled = true; x.parentNode.style.opacity = '.5'; } });
+      if (CFG.su) { $('#goSec').onclick = function () { location.href = CFG.su; }; if (isMob()) setTimeout(function () { if (!ME.prof) location.href = CFG.su; }, 1500); }
+    }
+    async function prev() {
+      PRE.mic = $('#tmic').checked; PRE.cam = $('#tcam').checked;
+      if (PRE.stream) { PRE.stream.getTracks().forEach(function (t) { t.stop(); }); PRE.stream = null; }
+      if (!PRE.mic && !PRE.cam) { $('#pv').srcObject = null; return; }
+      try { PRE.stream = await navigator.mediaDevices.getUserMedia({ audio: PRE.mic ? { echoCancellation: true, noiseSuppression: true } : false, video: PRE.cam ? { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' } : false }); $('#pv').srcObject = PRE.stream;
+        if (PRE.mic) meter(PRE.stream, $('#lv i')); } catch (e) { var wasM = PRE.mic, wasC = PRE.cam; devFix(e, wasC && !wasM ? 'الكاميرا' : 'الميكروفون', async function () { $('#tmic').checked = wasM; $('#tcam').checked = wasC; await prev(); return !!PRE.stream; }, wasC && !wasM ? 'camera' : 'microphone'); $('#tmic').checked = false; $('#tcam').checked = false; PRE.mic = PRE.cam = false; }
+    }
+    function meter(stream, el) { try { var A = new (window.AudioContext || window.webkitAudioContext)(), an = A.createAnalyser(); an.fftSize = 256; A.createMediaStreamSource(stream).connect(an); var buf = new Uint8Array(an.frequencyBinCount); (function f() { if (!el.isConnected) { try { A.close(); } catch (e) { } return; } an.getByteFrequencyData(buf); var s = 0; for (var i = 0; i < buf.length; i++) s += buf[i]; el.style.width = Math.min(100, s / buf.length * 1.6) + '%'; requestAnimationFrame(f); })(); } catch (e) { } }
+    var CDT = 0; function tickCd() { clearInterval(CDT); var f = function () { var el = $('#cd'); if (!el) return clearInterval(CDT); var ms = startMs() - Date.now(); if (!startMs() || ms <= 0) { el.innerHTML = ST.live ? '<div style="background:rgba(255,77,94,.2);border-color:var(--live)"><b>● مباشر الآن</b><small>' + esc(LX.liveNow) + '</small></div>' : ''; return; } var dd = Math.floor(ms / 864e5), hh = Math.floor(ms % 864e5 / 36e5), mm = Math.floor(ms % 36e5 / 6e4), ss = Math.floor(ms % 6e4 / 1e3); el.innerHTML = [[dd, 'يوم'], [hh, 'ساعة'], [mm, 'دقيقة'], [ss, 'ثانية']].map(function (x) { return '<div><b>' + x[0] + '</b><small>' + x[1] + '</small></div>'; }).join(''); }; f(); CDT = setInterval(f, 1000); }
+    function netDot(s) { var el = $('#nd'); if (!el) return; el.className = 'dot ' + (s.live ? 'ok' : 'bad'); var n = $('#net'); if (n && s.live) n.firstChild.textContent = 'متصل بالقاعة بأمان ✓ '; }
+    async function join() {
+      var name = $('#fn').value.trim(); if (name.length < 3) { toast('اكتب اسمك الكامل'); $('#fn').focus(); return; }
+      ME.prof = { name: name, email: $('#fe').value.trim(), phone: $('#fp').value.trim(), cat: $('#fc').value, dept: $('#fd').value.trim() }; ls('prof', JSON.stringify(ME.prof));
+      $('#go').disabled = true; $('#go').textContent = '⏳ جارٍ الانضمام…'; unlockAudio();
+      ME.dev = { mob: /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent), ua: (navigator.userAgent.match(/(Edg|Chrome|Firefox|Safari)\/[\d.]+/) || [''])[0] };
+      if (PRE.stream) { PRE.stream.getTracks().forEach(function (t) { t.stop(); }); PRE.stream = null; }
+      send({ ty: 'hello', prof: ME.prof, dev: ME.dev, mic: PRE.mic, cam: PRE.cam, role: CFG.role || 'att', rk: CFG.rk || '' });
+      ME.wantMic = PRE.mic; ME.wantCam = PRE.cam; ME.joinedAt = Date.now();
+      waitView('بانتظار تأكيد القاعة…');
+      setTimeout(function () { if (!ME.admitted && !ME.lobbyAck) send({ ty: 'hello', prof: ME.prof, dev: ME.dev, mic: PRE.mic, cam: PRE.cam, role: CFG.role || 'att', rk: CFG.rk || '' }); }, 4000);
+      setInterval(function () { if (ME.prof) send({ ty: 'hb', mic: ME.mic, cam: ME.cam, hand: ME.hand, rtc: ME.rtc, vis: !d.hidden, scr: !!ME.scr, rcap: RCAP }); }, 15000);
+    }
+    function waitView(msg) { if (ME.admitted) return; app.innerHTML = '<div class="wait"><div class="card" style="max-width:520px">' + brandHtml() + '<div class="ring" style="margin-top:20px"></div><h2 style="margin:0 0 6px">' + esc(msg) + '</h2><div class="note">' + esc(EV.title || '') + '</div><div class="cd" id="cd"></div></div></div>'; tickCd(); }
+
+    /* ───── القاعة ───── */
+    function hall() {
+      app.innerHTML = '<div class="hall"><div class="top">' + (CFG.logo ? '<img src="' + CFG.logo + '" alt="" style="height:34px;max-width:38vw;object-fit:contain;background:#fff;border-radius:9px;padding:3px 6px">' : '') + '<div class="tt2"><b>' + esc(EV.title || '') + '</b><small>' + esc(EV.type || '') + ' · ' + esc(EV.org || 'مركز البحوث والدراسات الاستشارية') + '</small></div><div class="spk" id="spk"><span class="mic">🎙</span><span class="tx"><small>' + esc(LX.spkNow) + '</small><b id="spkN"></b><em id="spkS"></em></span></div><span id="lv2" class="live off"><i></i> لم تبدأ</span><span style="font-size:12px;color:var(--m)" id="cnt"></span><a id="ext" target="_blank" rel="noopener" style="display:none;color:#05202b;background:var(--g);border-radius:99px;padding:2px 10px;font-size:12px;font-weight:900;text-decoration:none">البث الاحتياطي ↗</a><span class="dot" id="nd2" title="الاتصال"></span></div><div class="agb" id="agb"></div>' +
+        '<div class="main"><div class="stage" id="stg"><video id="rv" autoplay playsinline muted></video><img id="snap" alt="" style="display:none"><div class="ph" id="ph">' + (CFG.poster ? '<img src="' + CFG.poster + '" alt="">' : '') + '<b style="font-size:18px" id="phT">سيبدأ البث قريبًا</b><div class="cd" id="cd" style="width:min(420px,90%)"></div></div><div class="tick" id="tk"></div><div class="cap" id="cp"></div><div class="rx" id="rx"></div><div class="self" id="sf"><video id="sv" autoplay playsinline muted></video></div><div class="sg" id="sg"><button id="sgb">🔊 اضغط لتشغيل الصوت</button></div></div>' +
+        '<div class="side"><div class="tabs">' + [['agenda', LX.tabAgenda], ['notes', LX.notesTab], ['chat', 'الدردشة'], ['qa', 'الأسئلة'], ['poll', 'التصويت']].map(function (t) { return '<button data-t="' + t[0] + '" class="' + (ME.tab === t[0] ? 'on' : '') + '">' + t[1] + '<em style="display:none"></em></button>'; }).join('') + '</div><div class="pane" id="pane"></div><div class="inp" id="inp"></div></div></div>' +
+        '<div class="bar" style="position:relative"><button class="cb dim" id="bm" title="الميكروفون">🎙<span class="lb"><span class="lf">الميكروفون</span><span class="ls">المايك</span></span></button><button class="cb dim" id="bc" title="الكاميرا">📷<span class="lb"><span class="lf">الكاميرا</span><span class="ls">الكاميرا</span></span></button><button class="cb" id="bsh" title="مشاركة الشاشة لعرض محتوى من جهازك">🖥<span class="lb"><span class="lf">مشاركة الشاشة</span><span class="ls">الشاشة</span></span></button><button class="cb" id="bh" title="رفع اليد / طلب مداخلة">✋<span class="lb"><span class="lf">رفع اليد</span><span class="ls">اليد</span></span></button><button class="cb" id="br" title="تفاعل">👏<span class="lb"><span class="lf">تفاعل</span><span class="ls">تفاعل</span></span></button><button class="cb" id="bs" title="تشغيل الصوت">🔊<span class="lb"><span class="lf">الصوت</span><span class="ls">الصوت</span></span></button><button class="cb" id="bf" title="ملء الشاشة">⛶<span class="lb"><span class="lf">ملء الشاشة</span><span class="ls">تكبير</span></span></button><button class="cb red" id="bx" title="مغادرة">⏻<span class="lb"><span class="lf">مغادرة</span><span class="ls">خروج</span></span></button><div class="rxp" id="rxp">' + ['👏', '❤️', '👍', '🎉', '💡', '🤝', '🌟'].map(function (e) { return '<button data-e="' + e + '">' + e + '</button>'; }).join('') + '</div></div></div>';
+      $$('.tabs button').forEach(function (b) { b.onclick = function () { ME.tab = b.dataset.t; ME.unread[ME.tab] = 0; $$('.tabs button').forEach(function (x) { x.classList.toggle('on', x === b); }); pane(); }; });
+      $('#bh').onclick = function () { ME.hand = !ME.hand; this.classList.toggle('on', ME.hand); send({ ty: 'hand', on: ME.hand }); toast(ME.hand ? '✋ رُفعت يدك — سيدعوك ' + LX.host + ' للمداخلة' : 'أُنزلت يدك'); };
+      $('#br').onclick = function () { $('#rxp').classList.toggle('on'); }; $$('#rxp button').forEach(function (b) { b.onclick = function () { send({ ty: 'react', e: b.dataset.e }); floatR(b.dataset.e); $('#rxp').classList.remove('on'); }; });
+      $('#bf').onclick = function () { var s = $('#stg'); try { if (d.fullscreenElement) d.exitFullscreen(); else (s.requestFullscreen || s.webkitRequestFullscreen).call(s); } catch (e) { } };
+      $('#bs').onclick = function () { if (!SND.on) soundOn(); else { RA.muted = !RA.muted; snd(); } };
+      $('#sgb').onclick = function () { soundOn(); };
+      $('#bx').onclick = function () { if (!confirm('مغادرة القاعة؟')) return; send({ ty: 'bye' }); try { RT.pc && RT.pc.close(); } catch (e) { } endView(true); };
+      $('#bm').onclick = function () { if (!ME.stage) { ME.wantMic = true; return askStage(); } toggleMic(); }; $('#bc').onclick = function () { if (!ME.stage) { ME.wantCam = true; return askStage(); } toggleCam(); }; $('#bsh').onclick = function () { toggleScr(); }; if (!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia)) $('#bsh').style.display = 'none';
+      window.__rvBgOff = true; atStart();
+      $('#pane').addEventListener('click', function (e) { var b = e.target.closest && e.target.closest('[data-ni]'); if (b && ME.tab === 'agenda') noteModal(+b.getAttribute('data-ni')); });
+      clearInterval(ME.agT); ME.agT = setInterval(agBar, 1000);
+      pane(); applyState(); tickCd(); agBar(); spkShow(ST.spk);
+      if (window.RTCPeerConnection) startRtc(); else { ME.rtc = 'none'; send({ ty: 'nortc' }); }
+    }
+    function pane() {
+      var p = $('#pane'), inp = $('#inp'); if (!p) return; var t = ME.tab;
+      if (t === 'agenda') { p.innerHTML = (EV.sessions || []).length ? '<div class="note" style="margin:0 0 4px">✍️ ' + esc(LX.noteHint) + '</div>' + agendaHtml(true) : '<div class="note">لا يوجد برنامج منشور.</div>'; inp.innerHTML = ''; inp.style.display = 'none'; }
+      else if (t === 'chat') { inp.style.display = ''; p.innerHTML = CHAT.map(function (m) { return '<div class="msg' + (m.pid === ME.pid ? ' me' : '') + (m.h ? ' h' : '') + '"><b>' + esc(m.n) + (m.h ? ' · ' + esc(LX.host) : '') + '</b><div>' + esc(m.t) + '</div></div>'; }).join('') || '<div class="note">ابدأ المحادثة… الرسائل تمر عبر ' + esc(LX.host) + '.</div>'; if (!inp.querySelector('#ci')) { inp.innerHTML = '<input class="i" id="ci" placeholder="' + (ST.chat ? 'اكتب رسالة…' : 'الدردشة مغلقة حاليًا') + '"' + (ST.chat ? '' : ' disabled') + '><button id="cs">إرسال</button>'; $('#cs').onclick = sendChat; $('#ci').onkeydown = function (e) { if (e.key === 'Enter') sendChat(); }; } p.scrollTop = p.scrollHeight; }
+      else if (t === 'qa') { inp.style.display = ''; p.innerHTML = QA.slice().sort(function (a, b) { return (b.pin - a.pin) || (b.v - a.v); }).map(function (q) { var mine = q.up && q.up.indexOf(ME.pid) >= 0; return '<div class="q' + (q.ans ? ' ans' : '') + (q.pin ? ' pin' : '') + '"><button data-up="' + q.id + '" class="' + (mine ? 'on' : '') + '">▲ ' + q.v + '</button><b>' + esc(q.t) + '</b><br><small>' + esc(q.n) + (q.ans ? ' · ✓ تمت الإجابة' : q.pin ? ' · 📌 يُجاب الآن' : '') + '</small></div>'; }).join('') || '<div class="note">' + esc(LX.qaHint) + '</div>'; $$('[data-up]', p).forEach(function (b) { b.onclick = function () { send({ ty: 'upq', qid: b.dataset.up }); }; }); if (!inp.querySelector('#qi')) { inp.innerHTML = '<input class="i" id="qi" placeholder="' + esc(LX.qaPh) + '"><button id="qs">سؤال</button>'; $('#qs').onclick = sendQ; $('#qi').onkeydown = function (e) { if (e.key === 'Enter') sendQ(); }; } }
+      else if (t === 'notes') { inp.style.display = 'none'; var S1 = EV.sessions || [], grp = {}, oi = []; NOTES.forEach(function (n) { if (!grp[n.i]) { grp[n.i] = []; oi.push(n.i); } grp[n.i].push(n); }); oi.sort(function (a, b) { return a - b; });
+        p.innerHTML = '<div class="note" style="margin:0 0 6px">ما يعرضه ' + esc(LX.host) + ' من ' + esc(LX.notesTab) + ' للجميع — اضغط ▲ لتأييد ما تراه مناسبًا (تأييدك يُحفظ باسمك).</div>' + (oi.length ? oi.map(function (i) { return '<b style="font-size:12.5px;color:var(--g)">' + (+i + 1) + '. ' + esc((S1[i] || {}).t || grp[i][0].it) + '</b>' + grp[i].slice().sort(function (a, b) { return b.v - a.v; }).map(function (n) { var mine = n.up && n.up.indexOf(ME.pid) >= 0; return '<div class="nt2"><button data-upn="' + n.id + '" class="' + (mine ? 'on' : '') + '">▲ ' + n.v + '</button><span class="k">' + esc(n.k) + '</span>' + esc(n.t) + '<br><small>' + esc(n.n) + '</small>' + (n.res ? '<div class="rs">🗳 ' + n.res.o.map(function (o, j) { return esc(o) + ': ' + n.res.r[j]; }).join(' · ') + (n.vd ? ' — ' + esc(n.vd) : '') + '</div>' : '') + '</div>'; }).join(''); }).join('') : '<div class="note">لم يُنشر شيء بعد. يمكنك إرسال توصية أو مقترح من تبويب «' + esc(LX.tabAgenda) + '».</div>');
+        $$('[data-upn]', p).forEach(function (b) { b.onclick = function () { send({ ty: 'upn', id: b.dataset.upn }); AT.lastAct = Date.now(); }; }); }
+      else if (t === 'poll') { inp.style.display = 'none'; if (!POLL) { p.innerHTML = '<div class="note">لا يوجد تصويت مفتوح الآن. سيظهر هنا فور إطلاقه.</div>'; return; } var tot = POLL.res ? POLL.res.reduce(function (a, b) { return a + b; }, 0) : 0, mv = MYVOTE[POLL.id]; p.innerHTML = '<div class="poll"><h4>📊 ' + esc(POLL.q) + '</h4>' + POLL.opts.map(function (o, i) { var n = POLL.res ? POLL.res[i] || 0 : 0, pc = tot ? Math.round(n * 100 / tot) : 0, show = mv != null || POLL.closed; return '<button class="opt' + (mv === i ? ' mine' : '') + '" data-o="' + i + '"' + (POLL.closed ? ' disabled' : '') + '>' + (show ? '<i style="width:' + pc + '%"></i>' : '') + '<span>' + esc(o) + '</span>' + (show ? '<em>' + pc + '%</em>' : '') + '</button>'; }).join('') + '<div class="note">' + (POLL.closed ? 'أُغلق التصويت · ' : '') + tot + ' صوتًا' + (mv != null ? ' · صوّتّ ✓' : '') + '</div></div>'; $$('[data-o]', p).forEach(function (b) { b.onclick = function () { if (POLL.closed) return; var oi = +b.dataset.o; if (/تعديل/.test(POLL.opts[oi])) return modVote(oi); MYVOTE[POLL.id] = oi; send({ ty: 'vote', poll: POLL.id, o: oi }); pane(); }; }); }
+    }
+    function badge(t) { if (ME.tab === t) return; ME.unread[t] = (ME.unread[t] || 0) + 1; var b = $('.tabs [data-t=' + t + '] em'); if (b) { b.style.display = ''; b.textContent = ME.unread[t]; } }
+    function sendChat() { var i = $('#ci'); if (!i || !i.value.trim() || !ST.chat) return; send({ ty: 'chat', t: i.value.trim().slice(0, 500) }); i.value = ''; }
+    function sendQ() { var i = $('#qi'); if (!i || !i.value.trim()) return; send({ ty: 'q', t: i.value.trim().slice(0, 400) }); i.value = ''; toast('✅ أُرسل سؤالك'); }
+    function floatR(e) { var L = $('#rx'); if (!L) return; var s = d.createElement('span'); s.textContent = e; s.style.left = (10 + Math.random() * 80) + '%'; L.appendChild(s); setTimeout(function () { s.remove(); }, 3300); }
+    /* شريط البند الحالي: الوقت المستهلك من الوقت المخصص (بتوقيت غرفة التحكم) */
+    function agBar() {
+      var el = $('#agb'); if (!el) return; var a = ST.ag, S = EV.sessions || [], it = a && S[a.i], ch = EV.chair;
+      if (!it && !ch) { if (el.innerHTML) el.innerHTML = ''; el.className = 'agb'; return; }
+      var now = Date.now() - (OFF || 0), e = a ? (a.pz != null ? a.pz : Math.max(0, now - a.t0)) : 0, pl = a ? a.plan || 0 : 0, cls = pl ? (e > pl ? 'x' : pl - e < 60000 ? 'w' : '') : '';
+      if (el.className !== 'agb ' + cls) el.className = 'agb ' + cls;
+      /* الهيكل يُبنى عند تغيّر البند فقط، والعدّاد يُحدَّث في مكانه كل ثانية (بلا وميض أو إعادة رسم) */
+      var qo = ST.quo; var key = (it ? a.i + '|' + it.t + '|' + !!pl : '') + '|' + (ch ? ch.name + ch.role : '') + '|' + (qo ? qo.t + qo.ok : '');
+      if (el.__k !== key) { el.__k = key; el.innerHTML = '<div class="in">' + (it ? '<span class="nm"><small>' + esc(LX.cur) + ' ' + (a.i + 1) + '/' + S.length + '</small>' + esc(it.t) + '</span><span class="tm">-</span>' + (pl ? '<span class="lf">-</span>' : '') : '<span class="nm"></span>') + (ch ? '<span class="ch">👤 ' + esc(LX.chairLbl) + ': <b>' + esc(ch.name) + '</b>' + (ch.role ? ' — ' + esc(ch.role) : '') + '</span>' : '') + '</div>' + (it && pl ? '<div class="pb"><i></i></div>' : ''); }
+      if (it) { var tm = el.querySelector('.tm'), lf = el.querySelector('.lf'), pb = el.querySelector('.pb i'), s1 = '⏱ ' + (pl ? mmss(e) + ' / ' + mmss(pl) : mmss(e)) + (a.pz != null ? ' ⏸' : ''); if (tm && tm.firstChild.nodeValue !== s1) tm.firstChild.nodeValue = s1; if (lf) lf.firstChild.nodeValue = e > pl ? 'تجاوز ' + mmss(e - pl) : 'متبقٍ ' + mmss(pl - e); if (pb) pb.style.width = Math.min(100, e * 100 / pl) + '%'; }
+    }
+    /* اسم المتحدث بوميض ضوئي أعلى نافذة البث */
+    function spkShow(s) { var el = $('#spk'); if (!el) return; if (s && s.n) { $('#spkN').textContent = s.n; $('#spkS').textContent = s.sub || ''; el.classList.add('on'); } else el.classList.remove('on'); }
+    /* مشاركة على بند: توصية / سؤال / مقترح → تُحفظ في ملف المشارك لدى غرفة التحكم وتظهر في التقرير */
+    function noteModal(i) {
+      var s = (EV.sessions || [])[i]; if (!s || d.querySelector('.mod')) return; var K = KINDS(), k = 0;
+      var m = d.createElement('div'); m.className = 'mod'; m.innerHTML = '<div class="card"><h2 style="margin:0 0 4px;font-size:18px">✍️ ' + esc(LX.noteTitle) + '</h2><div class="note" style="margin-top:0">' + esc(LX.item) + ' ' + (i + 1) + ': <b style="color:#fff">' + esc(s.t) + '</b></div><div class="kd">' + K.map(function (x, j) { return '<button data-k="' + j + '" class="' + (j ? '' : 'on') + '">' + esc(x) + '</button>'; }).join('') + '</div><textarea class="i" id="ntx" rows="5" maxlength="900" placeholder="اكتب هنا…"></textarea><div class="note">تُرسل مشفّرة إلى ' + esc(LX.host) + ' وتُحفظ باسمك «' + esc(ME.prof ? ME.prof.name : '') + '» في ملفك وتظهر في التقرير.</div><button class="btn" id="nsb">إرسال</button><button class="btn" id="nsx" style="background:transparent;color:var(--m);box-shadow:none;margin-top:4px">إلغاء</button></div>';
+      d.body.appendChild(m); $$('.kd button', m).forEach(function (b) { b.onclick = function () { k = +b.dataset.k; $$('.kd button', m).forEach(function (x) { x.classList.toggle('on', x === b); }); $('#ntx', m).focus(); }; });
+      $('#nsx', m).onclick = function () { m.remove(); }; m.addEventListener('click', function (e) { if (e.target === m) m.remove(); }); setTimeout(function () { var x = $('#ntx', m); if (x) x.focus(); }, 50);
+      $('#nsb', m).onclick = function () { var tx = $('#ntx', m).value.trim(); if (tx.length < 2) { toast('اكتب نص ' + K[k]); return; } send({ ty: 'note', i: i, k: k, t: tx.slice(0, 900) }); MYN[i] = (MYN[i] || 0) + 1; try { ls('notes', JSON.stringify(MYN)); } catch (e) { } m.remove(); toast('✅ أُرسلت ' + K[k] + ' على «' + s.t + '»'); if (ME.tab === 'agenda') pane(); };
+    }
+    /* الترجمة النصية من متصفح المتحدث على المنصة (أسرع وأدق لصوته) */
+    var SRX = { r: null, on: false, last: 0 };
+    function srSync() { var SRc = window.SpeechRecognition || window.webkitSpeechRecognition, want = !!(SRc && ME.stage && ME.mic && ST.capOn); if (want && !SRX.on) srStart(SRc); else if (!want && SRX.on) srStop(); }
+    function srStart(SRc) {
+      var r; try { r = new SRc(); } catch (e) { return; } r.lang = ST.capLang || 'ar-SA'; r.continuous = true; r.interimResults = true; SRX.r = r; SRX.on = true;
+      r.onresult = function (e) { var it = ''; for (var i = e.resultIndex; i < e.results.length; i++) { var x = e.results[i]; if (x.isFinal) { var tx = x[0].transcript.trim(); if (tx) send({ ty: 'cap', t: tx.slice(0, 400), fin: 1 }); } else it += x[0].transcript; } var now = Date.now(); if (it && now - SRX.last > 260) { SRX.last = now; send({ ty: 'cap', t: it.trim().slice(-300), fin: 0 }); } };
+      r.onerror = function (ev) { if (ev && (ev.error === 'not-allowed' || ev.error === 'service-not-allowed')) SRX.on = false; };
+      r.onend = function () { if (SRX.on && SRX.r === r) setTimeout(function () { if (SRX.on && SRX.r === r) try { r.start(); } catch (e) { } }, 80); };
+      try { r.start(); } catch (e) { }
+    }
+    function srStop() { SRX.on = false; try { SRX.r && SRX.r.stop(); } catch (e) { } SRX.r = null; }
+    /* صوت البث في عنصر صوت مستقل: الصورة تعمل تلقائيًا (مكتومة) على كل الأجهزة، والصوت يُفتح بلمسة واحدة
+       على الجوال (iPhone/Android تمنع تشغيل الصوت دون لمسة) — ويُهيَّأ مسبقًا بلمسة «دخول القاعة» نفسها */
+    var RA = null, SND = { on: false };
+    function audioEl() { if (RA) return RA; RA = d.createElement('audio'); RA.setAttribute('playsinline', ''); RA.setAttribute('webkit-playsinline', ''); RA.autoplay = true; RA.style.display = 'none'; d.body.appendChild(RA); return RA; }
+    function unlockAudio() {
+      audioEl(); try { var A = ME.AC || (ME.AC = new (window.AudioContext || window.webkitAudioContext)()); A.resume && A.resume(); var o = A.createBufferSource(); o.buffer = A.createBuffer(1, 1, 22050); o.connect(A.destination); o.start(0); } catch (e) { }
+      try { RA.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAIlYAAESsAAACABAAZGF0YQAAAAA='; var p = RA.play(); if (p && p.then) p.then(function () { SND.unl = 1; }, function () { }); } catch (e) { }
+    }
+    function snd() { var b = $('#bs'), g = $('#sg'); if (b) { b.classList.toggle('on', SND.on && !RA.muted); b.classList.toggle('red', !SND.on); b.textContent = SND.on && RA.muted ? '🔇' : '🔊'; } if (g) g.classList.toggle('on', !SND.on && !!(RA && RA.srcObject)); }
+    function tryPlay() { if (!RA || !RA.srcObject) return; RA.muted = false; var p = RA.play(); if (p && p.then) p.then(function () { SND.on = true; snd(); }, function () { SND.on = false; snd(); }); else { SND.on = true; snd(); } }
+    function soundOn() { audioEl(); try { ME.AC && ME.AC.resume && ME.AC.resume(); } catch (e) { } RA.muted = false; var p = RA.play(); if (p && p.then) p.then(function () { SND.on = true; snd(); toast('🔊 تم تشغيل الصوت'); }, function () { SND.on = false; snd(); toast('تعذّر تشغيل الصوت — ارفع مستوى صوت جهازك ثم أعد المحاولة'); }); else { SND.on = true; snd(); } var v = $('#rv'); if (v) v.play().catch(function () { }); }
+    /* الميكروفون والكاميرا: على المنصة يعملان مباشرة، وخارجها تطلب اللمسة الكلمة من رئيس الجلسة */
+    function askStage() { if (ST.openMic) { ME.selfSt = true; send({ ty: 'selfstage' }); toast('🎙 جارٍ فتح ' + (ME.wantCam && !ME.wantMic ? 'الكاميرا' : 'الميكروفون') + ' — يمكنك التحدث مباشرة'); return; } ME.wantMic = ME.wantCam = false;
+      if (!ME.hand) { ME.hand = true; var bh = $('#bh'); if (bh) bh.classList.add('on'); send({ ty: 'hand', on: true }); } toast('✋ أُرسل طلب الكلمة — يتفعّل الميكروفون والكاميرا عندما يدعوك ' + LX.host + ' إلى المنصة'); }
+    function stageInvite() {
+      if (d.querySelector('.mod.si')) return; var m = d.createElement('div'); m.className = 'mod si';
+      m.innerHTML = '<div class="card" style="text-align:center"><div style="font-size:42px">🎤</div><h2 style="margin:4px 0">دعاك ' + esc(LX.host) + ' إلى المنصة</h2><div class="note" style="margin-top:0">شغّل الميكروفون للحديث، والكاميرا إن رغبت — يظهر اسمك لجميع الحضور أثناء حديثك.</div><div class="inv"><button id="siM">🎙 تشغيل الميكروفون</button><button id="siC" class="c2">📷 الكاميرا أيضًا</button></div><button class="btn" id="siX" style="background:transparent;color:var(--m);box-shadow:none">لاحقًا</button></div>';
+      d.body.appendChild(m);
+      $('#siM', m).onclick = function () { m.remove(); soundOn(); if (!ME.mic) toggleMic(); };
+      $('#siC', m).onclick = function () { m.remove(); soundOn(); if (!ME.mic) toggleMic(); if (!ME.cam) toggleCam(); };
+      $('#siX', m).onclick = function () { m.remove(); };
+    }
+    /* ═════ المتابعة الذكية للانتباه (تعمل على جهاز المشارك فقط) ═════
+       كل ثانية تُصنَّف حالته بقواعد صريحة ومهلات تمنع الأحكام العشوائية، وتُرسل عدّادات رقمية فقط (لا صورة ولا صوت) */
+    var AT = { on: false, sid: uid(), c: {}, st: '', stAt: 0, ev: [], lastAct: Date.now(), nud: {}, nN: 0, okRun: 0, okMax: 0, last: 0, blurN: 0, muteN: 0, talk: [], mOn: false, chk: null, lastAuto: 0, title: '', cs: ls('attc') || '' };
+    var ATG = { blur: 4, mute: 10, talk: 0 };
+    function attCfg() { return ST.att || EV.att || { lvl: 'std', nudge: true, auto: true }; }
+    function atStart() {
+      if (AT.on) return; AT.on = true; AT.title = d.title;
+      ['pointerdown', 'keydown', 'touchstart', 'wheel', 'mousemove'].forEach(function (ev) { d.addEventListener(ev, function () { AT.lastAct = Date.now(); }, { passive: true, capture: true }); });
+      d.addEventListener('visibilitychange', function () { if (!d.hidden) atTitle(false); });
+      setInterval(atTick, 1000);
+    }
+    function atCounting() { var C = attCfg(); return AT.on && C.lvl !== 'off' && ME.admitted && ST.live && !ST.ended && ST.phase !== 'break'; }
+    function atState(now) {
+      if (AT.chk && AT.chk.exp) return ['absent', 0];
+      if (!(ME.rtc === 'ok' || ME.rtc === 'fallback')) return ['net', 0];
+      if (d.hidden) return ['away', 0];
+      var foc = true; try { foc = d.hasFocus(); } catch (e) { } AT.blurN = foc ? 0 : AT.blurN + 1; if (AT.blurN > ATG.blur) return ['blur', AT.blurN === ATG.blur + 1 ? ATG.blur : 0];
+      var tk = AT.talk.slice(-5).reduce(function (a, b) { return a + b; }, 0); if (AT.mOn && !ME.stage && tk >= 3) return ['talk', 0];
+      if (ME.rtc === 'ok' && RA && RA.srcObject && (!SND.on || RA.muted)) { AT.muteN++; if (AT.muteN > ATG.mute) return ['mute', AT.muteN === ATG.mute + 1 ? ATG.mute : 0]; } else AT.muteN = 0;
+      if (now - AT.lastAct > 600000) return ['idle', 0];
+      return ['ok', 0];
+    }
+    function atTick() {
+      var now = Date.now(); if (!atCounting()) { if (AT.st) atSet('', now); return; }
+      var r = atState(now), s = r[0], g = r[1]; AT.c[s] = (AT.c[s] || 0) + 1; if (g && AT.c.ok >= g) { AT.c.ok -= g; AT.c[s] += g; }
+      if (s === 'ok' || s === 'idle') { AT.okRun++; AT.okMax = Math.max(AT.okMax, AT.okRun); } else if (s !== 'net' && s !== 'mute') AT.okRun = 0;
+      atSet(s, now - g * 1000); atNudge(s, now); atAuto(now);
+      if (s === 'away' || s === 'absent') atTitle(true);
+      if (now - AT.last > 10000) atSend();
+    }
+    function atSet(s, t) {
+      if (s === AT.st) return; var p = AT.st, dur = AT.stAt ? Math.round((t - AT.stAt) / 1000) : 0;
+      if (p && p !== 'ok' && p !== 'net' && dur >= 3) { AT.ev.push([AT.stAt, p, dur]); if (AT.ev.length > 60) AT.ev.shift(); atBack(p, dur); }
+      AT.st = s; AT.stAt = t; if (s && (s !== 'ok' || p)) { clearTimeout(AT.sT); AT.sT = setTimeout(atSend, 1500); }
+    }
+    function atSend() { if (!AT.on || !ME.admitted) return; AT.last = Date.now(); send({ ty: 'att', s: AT.sid, st: AT.st || 'ok', c: AT.c, ok: AT.okMax, ev: AT.ev.splice(0, AT.ev.length), n: AT.nN, m: AT.mOn ? 1 : 0, cs: AT.cs }); }
+    function atTitle(on) { clearInterval(AT.tI); if (!on) { if (AT.title) d.title = AT.title; return; } var k = 0; AT.tI = setInterval(function () { d.title = (k++ % 2) ? '⚠ الاجتماع مستمر — عُد إلى القاعة' : AT.title; if (!d.hidden && !(AT.chk && AT.chk.exp)) atTitle(false); }, 1500); }
+    function atBanner(msg, kind, force) {
+      var C = attCfg(), now = Date.now(); if (!force && (!C.nudge || (AT.nud[kind] && now - AT.nud[kind] < 120000))) return; AT.nud[kind] = now; if (!force) AT.nN++;
+      var o = d.querySelector('.atb'); if (o) o.remove(); var b = d.createElement('div'); b.className = 'atb'; b.innerHTML = '<span style="flex:1">' + esc(msg) + '</span><button>حسنًا</button>'; d.body.appendChild(b); b.querySelector('button').onclick = function () { b.remove(); AT.lastAct = Date.now(); }; setTimeout(function () { if (b.isConnected) b.remove(); }, 9000);
+    }
+    function atBack(p, dur) { if (dur < 15) return; if (p === 'away') atBanner('👀 ابتعدتَ عن صفحة الاجتماع ' + mmss(dur * 1000) + ' — متابعتك تُحتسب في حضورك الفعلي', 'away'); else if (p === 'blur') atBanner('🪟 كان تركيزك في نافذة أخرى ' + mmss(dur * 1000) + ' — نرجو متابعة الاجتماع', 'blur'); }
+    function atNudge(s, now) {
+      var dur = (now - AT.stAt) / 1000;
+      if (s === 'talk' && dur >= 6) atBanner('🤫 يبدو أنك تتحدث خارج الاجتماع — نرجو التركيز على مجرياته', 'talk');
+      else if (s === 'mute' && dur >= 30) atBanner('🔇 صوت البث مكتوم لديك — اضغط 🔊 لتسمع المداخلات', 'mute');
+    }
+    function atAuto(now) {
+      var C = attCfg(); if (!C.auto || AT.chk || now - AT.lastAuto < 900000) return;
+      if (AT.st === 'idle' && now - AT.lastAct > 720000) { AT.lastAuto = now; atCheck('a' + now.toString(36), 60, true); }
+    }
+    /* تأكيد الحضور: من غرفة التحكم أو تلقائيًا عند الخمول الطويل — مهلة الرد 60 ثانية */
+    function atCheck(id, sec, auto) {
+      var o = d.querySelector('.mod.chk'); if (o) o.remove(); var t0 = Date.now(); AT.chk = { id: id, t0: t0, auto: auto, exp: false };
+      var m = d.createElement('div'); m.className = 'mod chk'; m.innerHTML = '<div class="card" style="text-align:center;max-width:420px"><div style="font-size:40px">🙋</div><h2 style="margin:4px 0">تأكيد المتابعة</h2><div class="note" style="margin-top:0">' + esc(LX.host) + ' يطلب تأكيد متابعتك للاجتماع الآن.</div><div class="cd2" id="ckc">' + sec + '</div><button class="btn" id="ckb">✅ أنا متابع</button></div>';
+      d.body.appendChild(m); if (d.hidden) atTitle(true); try { if (navigator.vibrate) navigator.vibrate([120, 60, 120]); } catch (e) { }
+      var iv = setInterval(function () { var left = sec - Math.floor((Date.now() - t0) / 1000), c = $('#ckc', m); if (!m.isConnected) return clearInterval(iv); if (left > 0) { if (c) c.textContent = left; } else if (!AT.chk.exp) { AT.chk.exp = true; if (c) { c.textContent = '⏰'; c.style.color = '#ff7b72'; } var b = $('#ckb', m); if (b) b.textContent = '✅ عدتُ — أنا متابع'; atSend(); } }, 500);
+      $('#ckb', m).onclick = function () { clearInterval(iv); var late = AT.chk.exp, rt = Date.now() - t0; send({ ty: 'achk', id: id, rt: rt, late: late ? 1 : 0, auto: auto ? 1 : 0 }); AT.chk = null; AT.lastAct = Date.now(); m.remove(); atTitle(false); toast(late ? 'شكرًا — سُجّل عودتك' : '✅ شكرًا لتأكيد متابعتك'); };
+    }
+    /* المستوى المتقدم (بموافقة المشارك): رصد الحديث الجانبي عبر الميكروفون فقط — لا كاميرا مطلقًا، ولا تسجيل، والتحليل على جهازه */
+    function atAdv() {
+      var C = attCfg(); if (C.lvl !== 'adv' || AT.advAsked || !ME.admitted) return; AT.advAsked = 1;
+      if (AT.cs === 'y') { atMic(); return; } if (AT.cs === 'n') return;
+      var m = d.createElement('div'); m.className = 'mod'; m.innerHTML = '<div class="card" style="max-width:520px"><div style="font-size:36px;text-align:center">🎧</div><h2 style="margin:4px 0;text-align:center">رصد الحديث الجانبي</h2><div class="note" style="margin-top:0;font-size:13px">يطلب ' + esc(LX.host) + ' تفعيل رصد الحديث الجانبي أثناء الاجتماع عبر <b>الميكروفون</b> لمعرفة هل يوجد حديث خارج الاجتماع.<br>• لا تُستخدم الكاميرا مطلقًا.<br>• لا يُنقل صوتك ولا يُسجَّل ما لم تكن على المنصة — يُحلَّل على جهازك فقط وتُرسل مؤشرات رقمية.</div><div class="inv"><button id="acY">✔ موافق</button><button id="acN" class="c2">المتابعة الأساسية فقط</button></div></div>';
+      d.body.appendChild(m); $('#acY', m).onclick = function () { m.remove(); AT.cs = 'y'; ls('attc', 'y'); atMic(); atSend(); }; $('#acN', m).onclick = function () { m.remove(); AT.cs = 'n'; ls('attc', 'n'); atSend(); };
+    }
+    async function atMic() {
+      try {
+        var s = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false } }); AT.micS = s;
+        var A = ME.AC || (ME.AC = new (window.AudioContext || window.webkitAudioContext)()); try { A.resume(); } catch (e) { }
+        var an = A.createAnalyser(); an.fftSize = 1024; an.smoothingTimeConstant = 0.2; A.createMediaStreamSource(s).connect(an);
+        var bins = new Float32Array(an.frequencyBinCount), hz = A.sampleRate / an.fftSize, lo = Math.floor(300 / hz), hi = Math.ceil(3400 / hz), floor = -70, fr = [], env = [], penv = [], pan = null;
+        function band(a, b) { a.getFloatFrequencyData(b); var e = 0; for (var i = lo; i <= hi; i++) e += Math.pow(10, b[i] / 10); return 10 * Math.log10(e / (hi - lo + 1) + 1e-12); }
+        var pb = new Float32Array(an.frequencyBinCount);
+        setInterval(function () {
+          if (!pan && RA && RA.srcObject) { try { pan = A.createAnalyser(); pan.fftSize = 1024; pan.smoothingTimeConstant = 0.2; A.createMediaStreamSource(RA.srcObject).connect(pan); } catch (e) { pan = null; } }
+          var e = band(an, bins), pe = pan ? band(pan, pb) : -100; floor = e < floor ? e : floor + 0.02; floor = Math.min(floor, -35);
+          var sp = e > floor + 14 && e > -58; fr.push(sp ? 1 : 0); env.push(e); penv.push(pe);
+          if (fr.length >= 10) { var nsp = fr.reduce(function (a, b) { return a + b; }, 0), r = corr(env, penv), leak = pan && r > 0.55 && Math.max.apply(null, penv) > -60; AT.talk.push(nsp >= 4 && !leak && !(ME.stage && ME.mic) ? 1 : 0); if (AT.talk.length > 30) AT.talk.shift(); fr = []; env = []; penv = []; }
+        }, 100);
+        AT.mOn = true;
+      } catch (e) { AT.mOn = false; }
+    }
+    function corr(a, b) { var n = a.length, ma = 0, mb = 0; for (var i = 0; i < n; i++) { ma += a[i]; mb += b[i]; } ma /= n; mb /= n; var sa = 0, sb = 0, s = 0; for (var j = 0; j < n; j++) { var x = a[j] - ma, y = b[j] - mb; s += x * y; sa += x * x; sb += y * y; } return sa && sb ? s / Math.sqrt(sa * sb) : 0; }
+    /* «موافق مع تعديل»: يكتب المشارك التعديل المطلوب ويُرسل مع صوته */
+    var MYMOD = {};
+    function modVote(oi) {
+      if (d.querySelector('.mod.mv')) return; var P0 = POLL, m = d.createElement('div'); m.className = 'mod mv';
+      m.innerHTML = '<div class="card"><h2 style="margin:0 0 4px;font-size:18px">✏️ ' + esc(P0.opts[oi]) + '</h2><div class="note" style="margin-top:0">' + esc(P0.q) + '</div><label class="f">التعديل أو الملاحظة المطلوبة</label><textarea class="i" id="mvt" rows="4" maxlength="600" placeholder="اكتب التعديل الذي تشترطه للموافقة…">' + esc(MYMOD[P0.id] || '') + '</textarea><button class="btn" id="mvs">إرسال الصوت مع التعديل</button><button class="btn" id="mvx" style="background:transparent;color:var(--m);box-shadow:none;margin-top:4px">إلغاء</button></div>';
+      d.body.appendChild(m); setTimeout(function () { var x = $('#mvt', m); if (x) x.focus(); }, 50);
+      $('#mvx', m).onclick = function () { m.remove(); }; m.addEventListener('click', function (e) { if (e.target === m) m.remove(); });
+      $('#mvs', m).onclick = function () { var tx = $('#mvt', m).value.trim(); if (tx.length < 3) { toast('اكتب التعديل المطلوب'); return; } if (!POLL || POLL.id !== P0.id || POLL.closed) { m.remove(); toast('أُغلق التصويت'); return; } MYVOTE[P0.id] = oi; MYMOD[P0.id] = tx; send({ ty: 'vote', poll: P0.id, o: oi, note: tx }); m.remove(); toast('✅ أُرسل صوتك مع التعديل'); pane(); };
+    }
+    function applyState() {
+      var l = $('#lv2'); if (l) { l.className = 'live' + (ST.live ? '' : ' off'); l.innerHTML = '<i></i> ' + (ST.ended ? 'انتهت' : ST.live ? (ST.phase === 'break' ? 'استراحة' : 'مباشر') : 'لم تبدأ'); }
+      var c = $('#cnt'); if (c) c.textContent = ST.cnt ? '👥 ' + ST.cnt : '';
+      var tk = $('#tk'); if (tk) { var vidOn = (ME.rtc === 'ok' && !ST.raw) || ($('#snap') && $('#snap').style.display === 'block'); var cp0 = $('#cp'); if (cp0 && ME.rtc === 'ok' && !ST.raw) cp0.style.display = 'none'; tk.style.display = ST.ticker && !vidOn ? '' : 'none'; tk.style.top = ST.raw ? 'auto' : ''; tk.style.bottom = ST.raw ? '8px' : ''; tk.textContent = ST.ticker ? '📣 ' + ST.ticker : ''; }
+      try { agBar(); } catch (e) { }
+      var pT = $('#phT'); if (pT) pT.textContent = ST.live ? 'جارٍ الاتصال بالبث…' : LX.soon;
+      if (ME.tab === 'agenda') pane();
+      var bm = $('#bm'), bc = $('#bc'); if (bm) { bm.disabled = false; bc.disabled = false; bm.classList.toggle('dim', !ME.stage && !ST.openMic); bc.classList.toggle('dim', !ME.stage && !ST.openMic); bm.classList.toggle('on', ME.mic); bc.classList.toggle('on', ME.cam); bm.title = ME.stage ? 'الميكروفون' : ST.openMic ? 'اضغط لفتح الميكروفون والتحدث مباشرة' : 'طلب الكلمة لتفعيل الميكروفون'; }
+      var bsh = $('#bsh'); if (bsh) { bsh.classList.toggle('on', !!ME.scr); bsh.classList.toggle('go', !ME.scr && !!ME.scrOk); bsh.classList.toggle('dim', !ME.scr && !ME.stage && !ME.scrReq); bsh.title = ME.scr ? 'إيقاف مشاركة الشاشة' : ME.scrReq ? 'طلب مشاركة الشاشة قيد الانتظار' : ME.stage ? 'مشاركة الشاشة الآن' : 'طلب مشاركة الشاشة من ' + LX.host; var lf = bsh.querySelector('.lf'); if (lf) lf.textContent = ME.scr ? 'إيقاف العرض' : ME.scrReq ? 'بانتظار الموافقة' : 'مشاركة الشاشة'; }
+      var ex = $('#ext'); if (ex) { ex.style.display = ST.ext ? '' : 'none'; if (ST.ext) ex.href = ST.ext; }
+      if (ST.ended && !ME.endShown) { ME.endShown = 1; endView(false); }
+      agBar(); srSync(); if (ME.admitted && ST.live) atAdv();
+    }
+
+    /* ───── WebRTC: اتصال واحد بالقاعة (استقبال البث + الإرسال عند الصعود للمنصة) ───── */
+    var RT = { pc: null, a: null, v: null, mic: null, camT: null, tries: 0, t0: 0 };
+    function ice() { return (CFG.ice && CFG.ice.length) ? CFG.ice : [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }, { urls: 'stun:stun.cloudflare.com:3478' }]; }
+    /* v423: «شجرة البث» — الحاسوب القوي يعيد بث ما يستقبله إلى حتى 4 حضور آخرين، فتتسع القاعة لمئات المشاركين دون خادم */
+    var RCAP = !isMob() && ((navigator.hardwareConcurrency || 4) >= 4 || (function () { try { return localStorage.getItem('rasc_relay_force') === '1'; } catch (e) { return false; } })()) && !!window.RTCPeerConnection, KIDS = {};
+    function kidFeed(K) { var pa = RT.progT || RT.audT || null; try { if (K.v) K.v.replaceTrack(RT.vT || null).catch(function () { }); if (K.a) K.a.replaceTrack(pa).catch(function () { }); if (K.pa) K.pa.replaceTrack(pa).catch(function () { }); } catch (e) { } }
+    function kidsRefresh() { Object.keys(KIDS).forEach(function (k) { kidFeed(KIDS[k]); }); }
+    function relRep() { send({ ty: 'rly', kids: Object.keys(KIDS).filter(function (k) { return KIDS[k].pc.connectionState === 'connected'; }) }); }
+    async function relayServe(m) {
+      var n = Object.keys(KIDS).filter(function (k) { return k !== m.from; }).length;
+      if (!RCAP || ME.rtc !== 'ok' || !RT.vT || n >= (+ST.fan || 4)) { bus.pub(T + '/p/' + m.from, { ty: 'rly-no', sid: m.sid, from: ME.pid }).catch(function () { }); return; }
+      try { KIDS[m.from] && KIDS[m.from].pc.close(); } catch (e) { }
+      var pc = new RTCPeerConnection({ iceServers: ice() }), K = KIDS[m.from] = { pc: pc, sid: m.sid };
+      pc.onconnectionstatechange = function () { var st = pc.connectionState; if (st === 'failed' || st === 'closed') { if (KIDS[m.from] === K) delete KIDS[m.from]; relRep(); } else if (st === 'connected') relRep(); };
+      try {
+        await pc.setRemoteDescription({ type: 'offer', sdp: m.sdp }); var ai = 0;
+        pc.getTransceivers().forEach(function (t) { var k = t.receiver && t.receiver.track && t.receiver.track.kind; try { t.direction = 'sendonly'; } catch (e) { } if (k === 'video') K.v = t.sender; else if (k === 'audio') { if (ai++ === 0) K.a = t.sender; else K.pa = t.sender; } });
+        kidFeed(K); setTimeout(function () { try { if (!K.v) return; var P = K.v.getParameters(); if (!P.encodings || !P.encodings.length) P.encodings = [{}]; P.encodings[0].maxBitrate = 1200000; K.v.setParameters(P).catch(function () { }); } catch (x) { } }, 1500); var ans = await pc.createAnswer(); await pc.setLocalDescription(ans); await iceDone(pc, 2000);
+        bus.pub(T + '/p/' + m.from, { ty: 'rly-answer', sid: m.sid, sdp: pc.localDescription.sdp, from: ME.pid }).catch(function () { });
+      } catch (e) { try { pc.close(); } catch (x) { } delete KIDS[m.from]; bus.pub(T + '/p/' + m.from, { ty: 'rly-no', sid: m.sid, from: ME.pid }).catch(function () { }); }
+    }
+    async function startRtc(parent) {
+      try { RT.pc && RT.pc.close(); } catch (e) { }
+      RT.parent = parent || ''; var pc = new RTCPeerConnection({ iceServers: ice() }); RT.pc = pc; RT.sid = uid(); RT.t0 = Date.now(); ME.rtc = 'connecting';
+      RT.a = pc.addTransceiver('audio', { direction: 'sendrecv' }); RT.v = pc.addTransceiver('video', { direction: 'sendrecv' }); RT.pa = RCAP ? pc.addTransceiver('audio', { direction: 'recvonly' }) : null;
+      if (RT.mic) RT.a.sender.replaceTrack(RT.mic); if (RT.scrT && RT.scrT.readyState === 'live') RT.v.sender.replaceTrack(RT.scrT); else if (RT.camT) RT.v.sender.replaceTrack(RT.camT);
+      var ms = new MediaStream(); pc.ontrack = function (e) { try { if ('jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 220; else if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = 0.22; } catch (x) { } if (RT.pa && e.transceiver === RT.pa) { RT.progT = e.track; kidsRefresh(); return; } ms.addTrack(e.track); if (e.track.kind === 'video') RT.vT = e.track; else RT.audT = e.track; kidsRefresh(); var v = $('#rv'); if (v) { v.muted = true; if (v.srcObject !== ms) v.srcObject = ms; v.play().catch(function () { }); } if (e.track.kind === 'audio') { audioEl(); RA.removeAttribute('src'); RA.srcObject = new MediaStream([e.track]); tryPlay(); } };
+      pc.onconnectionstatechange = function () { var s = pc.connectionState; if (s === 'connected') { ME.rtc = 'ok'; RT.tries = 0; var ph = $('#ph'); if (ph) ph.style.display = 'none'; $('#snap').style.display = 'none'; send({ ty: 'rtc', st: 'ok', via: RT.parent || '' }); } if (s === 'failed' || s === 'disconnected') { ME.rtc = 'fail'; setTimeout(function () { if (RT.pc === pc && pc.connectionState !== 'connected') retryRtc(); }, s === 'failed' ? 400 : 3500); } };
+      var off = await pc.createOffer(); await pc.setLocalDescription(off); await iceDone(pc, 3500);
+      if (parent) bus.pub(T + '/p/' + parent, { ty: 'rly-offer', from: ME.pid, sid: RT.sid, sdp: pc.localDescription.sdp }).catch(function () { });
+      else send({ ty: 'offer', sid: RT.sid, sdp: pc.localDescription.sdp, rcap: RCAP });
+      setTimeout(function () { if (RT.pc === pc && pc.connectionState !== 'connected') { if (RT.parent) { send({ ty: 'rly-fail', parent: RT.parent }); RT.parent = ''; } else retryRtc(); } }, parent ? 15000 : 25000);
+    }
+    function retryRtc() { RT.tries++; if (RT.tries > 3) { ME.rtc = 'fallback'; send({ ty: 'nortc' }); var pT = $('#phT'); if (pT) pT.textContent = 'شبكتك تمنع البث المباشر — تُعرض لقطات البث والترجمة والتفاعل'; return; } startRtc(); }
+    function iceDone(pc, ms) { return new Promise(function (res) { if (pc.iceGatheringState === 'complete') return res(); var t = setTimeout(res, ms); pc.addEventListener('icegatheringstatechange', function () { if (pc.iceGatheringState === 'complete') { clearTimeout(t); res(); } }); }); }
+    async function toggleMic() { if (!ME.stage) return; try { if (!RT.mic) { var s = await getAud({ echoCancellation: true, noiseSuppression: true, autoGainControl: true }); RT.mic = s.getAudioTracks()[0]; if (RT.a) await RT.a.sender.replaceTrack(RT.mic); ME.mic = true; } else { ME.mic = !ME.mic; RT.mic.enabled = ME.mic; } } catch (e) { ME.mic = false; devFix(e, 'الميكروفون', async function () { await toggleMic(); return !!ME.mic; }, 'microphone'); } send({ ty: 'hb', mic: ME.mic, cam: ME.cam, hand: ME.hand, rtc: ME.rtc }); applyState(); }
+    async function toggleCam() { if (!ME.stage) return; try { if (!RT.camT || RT.camT.readyState !== 'live') { var s = await getVid({ width: { ideal: 960 }, height: { ideal: 540 }, facingMode: 'user' }); RT.camT = s.getVideoTracks()[0]; if (RT.v && !ME.scr) await RT.v.sender.replaceTrack(RT.camT); ME.cam = true; $('#sv').srcObject = new MediaStream([RT.camT]); } else { ME.cam = !ME.cam; RT.camT.enabled = ME.cam; } } catch (e) { ME.cam = false; devFix(e, 'الكاميرا', async function () { await toggleCam(); return !!ME.cam; }, 'camera'); } var sf = $('#sf'); if (sf) sf.style.display = ME.cam ? 'block' : 'none'; send({ ty: 'hb', mic: ME.mic, cam: ME.cam, hand: ME.hand, rtc: ME.rtc }); applyState(); }
+    /* v417: مشاركة الشاشة من جهاز المشارك — بطلب يوافق عليه المضيف، وتظهر على الشاشة الرئيسية لجميع الحاضرين */
+    function mirrorChk() { var hs = 0; try { hs = +localStorage.getItem('rasc_hall_share') || 0; } catch (e) { } /* v419: الإشارة تبقى قائمة ما دام المضيف يعرض شاشته فعلًا (يؤكدها البث)، لأن المتصفح يبطئ مؤقتات غرفة التحكم حين تكون في الخلفية */ if (!ST.hostShr) ME.mgMan = false; var fresh = !!hs && (ST.hostShr ? Date.now() - hs < 15 * 60000 : Date.now() - hs < 6000), on = (!!ME.scr || fresh || !!ME.mgMan) && !ME.mgShow, st = $('#stg'); if (!st) return; var o = $('#mgx', st), rv = $('#rv'), sn = $('#snap');
+      if (on && !o) { o = d.createElement('div'); o.id = 'mgx'; o.style.cssText = 'position:absolute;inset:0;z-index:6;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;text-align:center;padding:16px;background:linear-gradient(160deg,#06303f,#041a24);color:#e8f1f4;font-size:13px;line-height:1.8'; o.innerHTML = '<b style="font-size:15px">🖥 العرض متوقف على هذا الجهاز أثناء مشاركة الشاشة</b><span style="color:#a9c3cd">حتى لا تتكرر الصورة داخل نفسها — بقية الحضور يرون العرض طبيعيًا.</span><button style="font:inherit;font-weight:800;border:1px solid #c8b37c;background:transparent;color:#ffe9a8;border-radius:10px;padding:5px 12px;cursor:pointer">إظهار العرض رغم ذلك</button>'; o.querySelector('button').onclick = function () { ME.mgShow = true; ME.mgMan = false; mirrorChk(); }; st.appendChild(o); if (rv) rv.style.visibility = 'hidden'; if (sn) sn.style.visibility = 'hidden'; }
+      else if (!on && o) { o.remove(); if (rv) rv.style.visibility = ''; if (sn) sn.style.visibility = ''; }
+      var mc = $('#mgc', st); if (false && ST.hostShr && !on && !ME.mgShow) { if (!mc) { mc = d.createElement('button'); mc.id = 'mgc'; mc.type = 'button'; mc.title = 'إن كانت هذه الصفحة مفتوحة على جهاز المضيف أثناء مشاركته لشاشته'; mc.textContent = '🖥 منع تكرار الصورة على هذا الجهاز'; mc.style.cssText = 'position:absolute;top:10px;left:10px;z-index:7;font:inherit;font-size:12px;font-weight:800;border:1px solid #c8b37c;background:rgba(3,18,25,.85);color:#ffe9a8;border-radius:9px;padding:5px 10px;cursor:pointer'; mc.onclick = function () { ME.mgMan = true; mirrorChk(); }; st.appendChild(mc); } } else if (mc) mc.remove();
+      if (!ME.scr && !fresh && !ST.hostShr) ME.mgShow = false; }
+    setInterval(mirrorChk, 1200);
+    function hbS() { send({ ty: 'hb', mic: ME.mic, cam: ME.cam, hand: ME.hand, rtc: ME.rtc, scr: !!ME.scr }); }
+    async function toggleScr() {
+      if (!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia)) { toast('جهازك لا يدعم مشاركة الشاشة من المتصفح — استخدم حاسوبًا'); return; }
+      if (ME.scr) { scrStop(); toast('أُوقفت مشاركة شاشتك'); return; }
+      if (!ME.stage && ST.openMic) { ME.selfSt = true; send({ ty: 'selfstage' }); }
+      else if (!ME.stage) { if (ME.scrReq) { toast('🖥 طلبك قيد الانتظار — سيظهر لك هنا عند موافقة ' + LX.host); return; } ME.scrReq = true; send({ ty: 'scrreq' }); AT.lastAct = Date.now(); applyState(); toast('🖥 أُرسل طلب مشاركة الشاشة إلى ' + LX.host + ' — ستصلك الموافقة هنا'); return; }
+      try { var s = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 15, max: 24 }, width: { ideal: 1920, max: 2560 }, height: { ideal: 1080, max: 1440 } }, audio: false, selfBrowserSurface: 'exclude', surfaceSwitching: 'include' });
+        RT.scrT = s.getVideoTracks()[0]; try { RT.scrT.contentHint = 'detail'; } catch (e) { } RT.scrT.onended = function () { if (ME.scr) { scrStop(); toast('أُوقفت مشاركة شاشتك'); } };
+        if (RT.v) await RT.v.sender.replaceTrack(RT.scrT); else toast('ℹ️ سيظهر عرضك فور اكتمال الاتصال المباشر');
+        ME.scr = true; ME.scrReq = false; ME.scrOk = false; ME.mgShow = false; hbS(); applyState(); mirrorChk(); toast('🖥 شاشتك تُعرض الآن على الجميع — اضغط الزر مرة أخرى للإيقاف');
+      } catch (e) { if (!e || e.name !== 'NotAllowedError') toast('تعذّرت مشاركة الشاشة: ' + ((e && e.message) || e)); }
+    }
+    function scrStop() { var t = RT.scrT; RT.scrT = null; if (t) { try { t.onended = null; t.stop(); } catch (e) { } } if (RT.v) { try { RT.v.sender.replaceTrack(RT.camT && RT.camT.readyState === 'live' ? RT.camT : null).catch(function () { }); } catch (e) { } } var was = ME.scr; ME.scr = false; if (was) hbS(); applyState(); mirrorChk(); }
+
+    /* ═════ v422: مُعالِج الميكروفون والكاميرا الذكي — يشخّص السبب الدقيق على جهاز المشارك، ويعالجه أو يعطيه إجراءً واحدًا يناسب حالته،
+       ثم يعيد المحاولة تلقائيًا لحظة السماح دون إعادة تحميل الصفحة ═════ */
+    function brw() { var u = navigator.userAgent || ''; return { inApp: /FBAN|FBAV|Instagram|WhatsApp|Line\/|Snapchat|; wv\)|MicroMessenger|LinkedInApp|Outlook-(iOS|Android)|GSA\//i.test(u), and: /Android/i.test(u), ios: /iPhone|iPad|iPod/i.test(u) || (navigator.maxTouchPoints > 1 && /Mac/.test(navigator.platform || '')), edge: /Edg\//.test(u), fx: /Firefox\//.test(u), saf: /Safari\//.test(u) && !/Chrome|CriOS|Edg|FxiOS/.test(u), win: /Windows/.test(u), mac: /Mac OS X/.test(u) && !/iPhone|iPad/.test(u) }; }
+    async function permOf(n) { try { return await navigator.permissions.query({ name: n }); } catch (e) { return null; } }
+    async function getAud(cons) { try { return await navigator.mediaDevices.getUserMedia({ audio: cons }); } catch (e) { if (e && /NotReadable|Overconstrained|Abort|TrackStart|ConstraintNotSatisfied/.test(e.name || '')) return await navigator.mediaDevices.getUserMedia({ audio: true }); throw e; } }
+    async function getVid(cons) { try { return await navigator.mediaDevices.getUserMedia({ video: cons }); } catch (e) { if (e && /NotReadable|Overconstrained|Abort|TrackStart|ConstraintNotSatisfied/.test(e.name || '')) return await navigator.mediaDevices.getUserMedia({ video: true }); throw e; } }
+    function devKind(e) { var n = (e && e.name) || '', m = String((e && e.message) || ''); if (insecure()) return 'insecure'; if (brw().inApp) return 'inapp'; if (n === 'NotAllowedError' || n === 'SecurityError' || n === 'PermissionDeniedError') return /system/i.test(m) ? 'os' : 'perm'; if (/NotReadable|TrackStart|Abort/.test(n)) return 'busy'; if (/NotFound|DevicesNotFound/.test(n)) return 'none'; return 'other'; }
+    async function devFix(e, w, retry, pn) {
+      if (d.querySelector('.mod.mf')) return; var B = brw(), k = devKind(e), P = await permOf(pn || 'microphone'), st = P ? P.state : '';
+      if (k === 'insecure' && CFG.su) { toast('جارٍ فتح القاعة الآمنة لتفعيل ' + w + '…'); setTimeout(function () { location.href = CFG.su; }, 900); return; }
+      if (k === 'perm' && st === 'prompt') k = 'dismissed';
+      var url = /^https:/.test(location.href) ? location.href : (CFG.su || ''), lock = B.edge ? 'رمز القفل 🔒' : 'رمز الإعدادات ⓘ أو القفل 🔒', H = '', act = '';
+      if (k === 'dismissed') H = '<p>أُغلقت نافذة الإذن دون اختيار. اضغط «تفعيل الآن» ثم اختر <b>«السماح»</b> (Allow).</p>';
+      else if (k === 'perm') H = B.ios ? '<ol><li>اضغط <b>aA</b> يسار شريط العنوان ← <b>إعدادات موقع الويب</b>.</li><li>اجعل <b>' + w + '</b> على <b>«سماح»</b>.</li></ol>' : B.and ? '<ol><li>اضغط ' + lock + ' بجوار العنوان ← <b>الأذونات</b>.</li><li>اجعل <b>' + w + '</b> على <b>«سماح»</b>.</li></ol>' : B.fx ? '<ol><li>اضغط رمز ' + w + ' المشطوب في شريط العنوان.</li><li>اختر <b>إزالة الحظر</b> ثم «تفعيل الآن».</li></ol>' : B.saf ? '<ol><li>من قائمة <b>Safari ← إعدادات هذا الموقع</b>.</li><li>اجعل <b>' + w + '</b> على <b>«سماح»</b>.</li></ol>' : '<ol><li>اضغط ' + lock + ' في أقصى يسار شريط العنوان.</li><li>اجعل <b>' + w + '</b> على <b>«سماح»</b> (Allow).</li></ol>';
+      else if (k === 'os') { H = B.mac ? '<p>نظام macOS يمنع المتصفح من ' + w + '.</p><ol><li>افتح <b>إعدادات النظام ← الخصوصية والأمان ← ' + (pn === 'camera' ? 'الكاميرا' : 'الميكروفون') + '</b>.</li><li>فعّل المتصفح الذي تستخدمه، ثم أعد فتحه.</li></ol>' : '<p>إعدادات خصوصية ويندوز تمنع المتصفح من ' + w + '.</p><ol><li>اضغط «فتح إعدادات الخصوصية».</li><li>فعّل <b>«الوصول إلى ' + (pn === 'camera' ? 'الكاميرا' : 'الميكروفون') + '»</b> و<b>«السماح لتطبيقات سطح المكتب بالوصول»</b>.</li></ol>'; act = B.mac ? '<a class="btn" style="text-decoration:none" href="x-apple.systempreferences:com.apple.preference.security?' + (pn === 'camera' ? 'Privacy_Camera' : 'Privacy_Microphone') + '">فتح إعدادات الخصوصية</a>' : B.win ? '<a class="btn" style="text-decoration:none" href="ms-settings:privacy-' + (pn === 'camera' ? 'webcam' : 'microphone') + '">فتح إعدادات الخصوصية</a>' : ''; }
+      else if (k === 'busy') H = '<p>' + w + ' مشغول ببرنامج آخر (Teams أو Zoom أو مكالمة أو تبويب آخر).</p><ol><li>أغلق ذلك البرنامج أو التبويب.</li><li>تُعاد المحاولة تلقائيًا.</li></ol>';
+      else if (k === 'none') H = '<p>لم يُعثر على ' + w + ' في هذا الجهاز. وصّل سماعة رأس بميكروفون أو كاميرا، وتُعاد المحاولة تلقائيًا.</p>' + (CFG.su && !isMob() ? '<p>أو افتح الرابط الآمن على جوالك واستخدمه ميكروفونًا.</p>' : '');
+      else if (k === 'inapp') { H = '<p>أنت تفتح القاعة داخل تطبيق (واتساب أو البريد أو غيرهما)، وهذه التطبيقات تمنع ' + w + '.</p><p><b>افتحها في ' + (B.ios ? 'Safari' : 'Chrome') + '</b>' + (B.ios ? ': اضغط ⋯ أو رمز المشاركة ← «فتح في Safari».' : '.') + '</p>'; if (url) act = (B.and ? '<a class="btn" style="text-decoration:none" href="intent://' + url.replace(/^https:\/\//, '') + '#Intent;scheme=https;package=com.android.chrome;end">فتح في Chrome</a>' : '') + '<button class="btn" data-mf="copy">نسخ رابط القاعة</button>'; }
+      else if (k === 'insecure') H = isMob() ? '<p>الجوالات لا تسمح بـ' + w + ' لملف دعوة يُفتح من الجهاز. اطلب من ' + esc(LX.host) + ' <b>الرابط الآمن</b> للقاعة، أو ادخل من حاسوب بمتصفح Chrome أو Edge.</p>' : '<p>هذا المتصفح لا يسمح بـ' + w + ' في ملف الدعوة. افتح الملف بمتصفح <b>Chrome</b> أو <b>Edge</b>، أو اطلب الرابط الآمن من ' + esc(LX.host) + '.</p>';
+      else H = '<p>تعذّر تشغيل ' + w + ': ' + esc(String((e && (e.message || e.name)) || '')) + '</p>';
+      var m = d.createElement('div'); m.className = 'mod mf'; m.innerHTML = '<div class="card" style="max-width:520px"><div style="font-size:34px;text-align:center">' + (pn === 'camera' ? '📷' : '🎙') + '</div><h2 style="margin:4px 0 8px;text-align:center">تفعيل ' + w + '</h2><div class="note" style="font-size:13.5px;line-height:1.9;margin:0">' + H + '</div><div data-mfs class="note" style="margin:6px 0 0;color:#e8d9a8">' + (/^(perm|os|busy|none)$/.test(k) ? '⏳ بانتظار السماح — ستُفعَّل تلقائيًا فور ذلك' : '') + '</div><div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:12px">' + (k === 'insecure' || k === 'inapp' ? '' : '<button class="btn" data-mf="go">تفعيل الآن</button>') + act + '<button class="btn" data-mf="x" style="background:transparent;border:1px solid var(--l);color:var(--m)">لاحقًا</button></div></div>';
+      d.body.appendChild(m); var done = false, iv = 0;
+      var close = function () { done = true; clearInterval(iv); if (P) P.onchange = null; m.remove(); };
+      var tryNow = async function (silent) { if (done) return; var ok = false; try { ok = await retry(true); } catch (x) { ok = false; } if (ok) { close(); toast('✅ تم تفعيل ' + w); } else if (!silent) { var sx = $('[data-mfs]', m); if (sx) sx.textContent = 'ما زال غير مسموح — اتبع الخطوات أعلاه'; } };
+      m.addEventListener('click', function (ev) { var b = ev.target.closest('[data-mf]'); if (!b) return; var a = b.getAttribute('data-mf'); if (a === 'x') close(); else if (a === 'go') tryNow(false); else if (a === 'copy') { try { navigator.clipboard.writeText(url); toast('نُسخ الرابط — الصقه في ' + (B.ios ? 'Safari' : 'Chrome')); } catch (x) { } } });
+      if (P) P.onchange = function () { if (P.state === 'granted') tryNow(true); };
+      if (/^(os|busy|none)$/.test(k)) iv = setInterval(function () { tryNow(true); }, 4000);
+      setTimeout(function () { if (!done) { clearInterval(iv); } }, 180000);
+    }
+    /* فحص مسبق في بوابة الدخول: يكتشف الحظر قبل الدخول فيُصلح مبكرًا */
+    async function devPreflight() { try { var box = $('#mfg'); if (!box) return; if (insecure()) return; var P = await permOf('microphone'); if (!P) return; var show = function () { box.innerHTML = P.state === 'denied' ? '<div class="note" style="border:1px solid #e2a59c;border-radius:12px;padding:8px 10px;background:rgba(229,56,74,.12);margin:8px 0">🎙 الميكروفون محظور في هذا المتصفح لهذه الصفحة. <button class="btn" id="mfgo" style="padding:4px 12px;margin-inline-start:6px">إصلاح الآن</button></div>' : ''; var b = $('#mfgo'); if (b) b.onclick = function () { devFix({ name: 'NotAllowedError' }, 'الميكروفون', async function () { try { var s = await getAud(true); s.getTracks().forEach(function (t) { t.stop(); }); return true; } catch (x) { return false; } }, 'microphone'); }; }; show(); P.onchange = show; } catch (e) { } }
+    function micErr(e, w) {
+      if (insecure()) { if (CFG.su) { toast('هذا الملف المحلي لا يسمح بـ' + w + ' — جارٍ فتح القاعة الآمنة…'); setTimeout(function () { location.href = CFG.su; }, 1800); } else toast('المتصفح لا يسمح بـ' + w + ' في ملف الدعوة المحلي — اطلب الرابط الآمن من ' + LX.host); return; }
+      var n = e && e.name; toast(n === 'NotAllowedError' || n === 'SecurityError' ? 'رُفض إذن ' + w + ' — اسمح به من إعدادات الموقع في المتصفح (رمز القفل 🔒 بجوار العنوان) ثم أعد المحاولة' : n === 'NotFoundError' ? 'لم يُعثر على ' + w + ' في جهازك' : n === 'NotReadableError' ? w + ' مستخدم في تطبيق آخر (مكالمة؟) — أغلقه ثم أعد المحاولة' : 'تعذّر تشغيل ' + w + ': ' + (e && e.message || n || ''));
+    }
+    function stageOff() { if (ME.scr) scrStop(); ME.stage = false; if (RT.mic) { RT.mic.enabled = false; } if (RT.camT) { RT.camT.enabled = false; } ME.mic = ME.cam = false; var sf = $('#sf'); if (sf) sf.style.display = 'none'; applyState(); }
+
+    /* ───── الاستبانة والنهاية ───── */
+    function surveyModal(S) {
+      if (d.querySelector('.mod')) return; var ans = { c: {}, nps: null, cm: '' };
+      var m = d.createElement('div'); m.className = 'mod'; m.innerHTML = '<div class="card"><h2 style="margin:0 0 4px">⭐ ' + esc(LX.survey) + '</h2><div class="note" style="margin-top:0">' + esc(LX.surveySub) + '</div>' + S.crit.map(function (c) { return '<div style="display:flex;justify-content:space-between;align-items:center;margin:8px 0;gap:8px"><b style="font-size:13.5px">' + esc(c[1]) + '</b><div class="stars" data-c="' + c[0] + '">' + [1, 2, 3, 4, 5].map(function (n) { return '<button data-n="' + n + '">★</button>'; }).join('') + '</div></div>'; }).join('') + (LX.nps ? '<label class="f">' + esc(LX.nps) + '</label>' : '') + '<div style="display:' + (LX.nps ? 'flex' : 'none') + ';gap:3px;direction:ltr" id="nps">' + [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(function (n) { return '<button data-v="' + n + '" style="flex:1;border:1px solid var(--l);background:var(--p);color:#fff;border-radius:8px;padding:6px 0;cursor:pointer">' + n + '</button>'; }).join('') + '</div><label class="f">ملاحظة أو مقترح</label><textarea class="i" id="scm" rows="3"></textarea><button class="btn" id="ssb">إرسال التقييم</button><button class="btn" id="ssx" style="background:transparent;color:var(--m);box-shadow:none;margin-top:4px">لاحقًا</button></div>';
+      d.body.appendChild(m);
+      $$('.stars', m).forEach(function (g) { $$('button', g).forEach(function (b) { b.onclick = function () { ans.c[g.dataset.c] = +b.dataset.n; $$('button', g).forEach(function (x) { x.classList.toggle('on', +x.dataset.n <= +b.dataset.n); }); }; }); });
+      $$('#nps button', m).forEach(function (b) { b.onclick = function () { ans.nps = +b.dataset.v; $$('#nps button', m).forEach(function (x) { x.style.background = +x.dataset.v === ans.nps ? 'var(--t)' : 'var(--p)'; }); }; });
+      $('#ssb', m).onclick = function () { ans.cm = $('#scm', m).value.trim(); if (!Object.keys(ans.c).length) { toast('قيّم معيارًا واحدًا على الأقل'); return; } send({ ty: 'survey', id: S.id, a: ans }); ls('sv_' + S.id, '1'); m.remove(); toast('🙏 شكرًا لتقييمك'); };
+      $('#ssx', m).onclick = function () { m.remove(); };
+    }
+    function endView(left) {
+      try { RT.pc && RT.pc.close(); } catch (e) { } [RT.mic, RT.camT].forEach(function (t) { try { t && t.stop(); } catch (e) { } });
+      app.innerHTML = '<div class="wait"><div class="card" style="max-width:600px">' + brandHtml() + '<div style="font-size:64px;margin:16px 0 4px">🌟</div><h2 style="margin:0">' + (left ? 'شكرًا لحضورك' : LX.ended) + '</h2><p class="sub">' + esc(EV.title || '') + '</p><div class="note">سُجّل حضورك' + (ME.prof ? ' باسم «' + esc(ME.prof.name) + '»' : '') + esc(LX.endNote) + '</div>' + (SURVEY && !ls('sv_' + SURVEY.id) ? '<button class="btn" id="sv2">⭐ قيّم الفعالية</button>' : '') + (left && !ST.ended ? '<button class="btn" id="rj" style="background:var(--t);color:#fff">العودة إلى القاعة</button>' : '') + '</div></div>';
+      var b = $('#sv2'); if (b) b.onclick = function () { surveyModal(SURVEY); }; var r = $('#rj'); if (r) r.onclick = function () { location.reload(); };
+      if (SURVEY && !ls('sv_' + SURVEY.id)) surveyModal(SURVEY);
+    }
+
+    /* ───── الرسائل من القاعة ───── */
+    bus.onStatus(function (s) { netDot(s); var n2 = $('#nd2'); if (n2) n2.className = 'dot ' + (s.live ? 'ok' : 'bad'); });
+    bus.sub(T + '/info', function (m, meta) { if (m.ty !== 'info') return; syncClock(m.st, !(meta && meta.retained)); if (m.ev) { EV = Object.assign(EV, m.ev); } if (m.poster && !CFG.poster) CFG.poster = m.poster; if (m.logo && !CFG.logo) CFG.logo = m.logo; Object.assign(ST, m.st || {}); if (!ME.prof && !app.firstChild) gate(); else if (!ME.prof && !ME.infoSeen) { ME.infoSeen = 1; if (!CFG.ev) gate(); } applyState(); });
+    bus.sub(T + '/d', function (m) {
+      if (m.ty === 'state') { syncClock(m.st, true); Object.assign(ST, m.st || {}); applyState(); spkShow(ST.spk); }
+      else if (m.ty === 'spk') { ST.spk = m.s || null; spkShow(ST.spk); }
+      else if (m.ty === 'chat') { CHAT.push(m.m); if (CHAT.length > 300) CHAT.shift(); if (m.m.del) CHAT = CHAT.filter(function (x) { return x.id !== m.m.del; }); if (ME.tab === 'chat') pane(); else badge('chat'); }
+      else if (m.ty === 'chatdel') { CHAT = CHAT.filter(function (x) { return x.id !== m.id; }); if (ME.tab === 'chat') pane(); }
+      else if (m.ty === 'qa') { QA = m.list || []; if (ME.tab === 'qa') pane(); }
+      else if (m.ty === 'poll') { var nw = !POLL || POLL.id !== (m.poll && m.poll.id); POLL = m.poll; if (ME.tab === 'poll') pane(); else if (nw && POLL) { badge('poll'); toast('📊 تصويت جديد: ' + POLL.q); } }
+      else if (m.ty === 'react') { (m.list || [m.e]).slice(0, 12).forEach(function (e, i) { setTimeout(function () { floatR(e); }, i * 140); }); }
+      else if (m.ty === 'cap') { var cp = $('#cp'); if (cp && ((ME.rtc === 'ok' && !ST.raw) || (POLL && !POLL.closed))) { cp.style.display = 'none'; } else if (cp) { cp.style.display = m.t ? 'block' : 'none'; cp.textContent = (m.n && m.t ? m.n + ': ' : '') + m.t; clearTimeout(capT); capT = setTimeout(function () { cp.style.display = 'none'; }, 6000); } }
+      else if (m.ty === 'snap') { if (ME.rtc === 'fallback' || ME.rtc === 'none') { var im = $('#snap'); if (im) { im.src = m.img; im.style.display = 'block'; $('#rv').style.display = 'none'; var ph = $('#ph'); if (ph) ph.style.display = 'none'; } } }
+      else if (m.ty === 'survey') { SURVEY = m.s; if (!ls('sv_' + SURVEY.id)) surveyModal(SURVEY); }
+      else if (m.ty === 'ann') toast('📣 ' + m.t);
+      else if (m.ty === 'notes') { var nn = NOTES.length; NOTES = m.list || []; if (ME.tab === 'notes') pane(); else if (NOTES.length > nn) badge('notes'); }
+    });
+    bus.sub(T + '/p/' + ME.pid, async function (m) {
+      if (m.ty === 'admit') { ME.lobbyAck = 1; if (!ME.admitted) { ME.admitted = true; hall(); } }
+      else if (m.ty === 'lobby') { ME.lobbyAck = 1; waitView('أنت في ردهة الانتظار — سيُدخلك ' + LX.host + ' بعد قليل'); }
+      else if (m.ty === 'reject') { app.innerHTML = '<div class="wait"><div class="card"><h2>تعذّر الدخول</h2><p class="note">' + esc(m.why || 'لم يُقبل طلب الدخول.') + '</p></div></div>'; }
+      else if (m.ty === 'kick') { endView(true); }
+      else if (m.ty === 'rly-offer') { relayServe(m); }
+      else if (m.ty === 'rly-answer' && RT.pc && m.sid === RT.sid) { try { await RT.pc.setRemoteDescription({ type: 'answer', sdp: m.sdp }); } catch (e) { } }
+      else if (m.ty === 'rly-no' && m.sid === RT.sid) { send({ ty: 'rly-fail', parent: RT.parent }); RT.parent = ''; }
+      else if (m.ty === 'relay' && m.parent) { RT.tries = 0; startRtc(m.parent); }
+      else if (m.ty === 'reparent' || m.ty === 'direct') { if (m.ty === 'reparent' || RT.parent) { RT.tries = 0; startRtc(); } }
+      else if (m.ty === 'answer' && RT.pc && m.sid === RT.sid) { try { await RT.pc.setRemoteDescription({ type: 'answer', sdp: m.sdp }); } catch (e) { } }
+      else if (m.ty === 'scrok') { ME.scrReq = false; ME.scrOk = true; applyState(); toast('✅ وافق ' + LX.host + ' على مشاركة شاشتك — اضغط زر «مشاركة الشاشة» واختر ما تعرضه'); }
+      else if (m.ty === 'scrno') { ME.scrReq = false; ME.scrOk = false; applyState(); toast('اعتذر ' + LX.host + ' عن مشاركة الشاشة الآن'); }
+      else if (m.ty === 'scrstop') { if (ME.scr) { scrStop(); toast('أوقف ' + LX.host + ' عرض شاشتك'); } }
+      else if (m.ty === 'stage') { if (m.on) { ME.stage = true; ME.hand = false; var bh = $('#bh'); if (bh) bh.classList.remove('on'); applyState(); var wM = ME.wantMic, wC = ME.wantCam, self = ME.selfSt; ME.wantMic = ME.wantCam = ME.selfSt = false; if (wM && !ME.mic) toggleMic(); if (wC && !ME.cam) toggleCam(); setTimeout(function () { if (ME.scrOk || self) return; if (ME.stage && !ME.mic) stageInvite(); else toast('🎤 دعاك ' + LX.host + ' إلى المنصة — ميكروفونك يعمل الآن'); }, 700); } else { stageOff(); toast('شكرًا لمداخلتك — عدت إلى مقاعد الحضور'); } }
+      else if (m.ty === 'hist') { CHAT = m.chat || CHAT; QA = m.qa || QA; NOTES = m.notes || NOTES; POLL = m.poll || POLL; if (m.st) { syncClock(m.st, true); Object.assign(ST, m.st); spkShow(ST.spk); } if (m.survey) SURVEY = m.survey; applyState(); pane(); }
+      else if (m.ty === 'fallback') { try { RT.pc && RT.pc.close(); } catch (e) { } RT.tries = 9; ME.rtc = 'fallback'; var pT2 = $('#phT'); if (pT2) pT2.textContent = m.why || 'القاعة ممتلئة بالبث المباشر — تُعرض لقطات البث الحيّة مع الترجمة والتفاعل'; }
+      else if (m.ty === 'mute') { if (RT.mic) { RT.mic.enabled = false; ME.mic = false; applyState(); toast('كتم ' + LX.host + ' الميكروفون'); } }
+      else if (m.ty === 'msg') toast('✉️ ' + m.t);
+      else if (m.ty === 'achk') { atCheck(m.id, m.sec || 60, false); }
+      else if (m.ty === 'nudge') { atBanner('🔔 ' + (m.t || 'نرجو متابعة الاجتماع'), 'host', true); AT.nN++; }
+      else if (m.ty === 'noteok') toast('📥 وصلت ' + (m.k || '') + ' إلى غرفة التحكم وحُفظت في ملفك');
+    });
+    if (CFG.ev) gate(); else app.innerHTML = '<div class="wait"><div><div class="ring"></div><b>جارٍ تحميل بيانات الفعالية…</b></div></div>';
+    addEventListener('beforeunload', function () { if (ME.prof) { try { send({ ty: 'bye' }); } catch (e) { } } });
+  })({"hashCfg":1,"logo":""});
+</script>
+</body></html>
